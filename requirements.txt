@@ -1,2 +1,16 @@
 # requirements
+
+# Data Processing
+pandas
+numpy
+
+# Graph Validation
+networkx
+
+# Web GUI & Visualization
 streamlit
+streamlit-folium
+folium
+
+# Testing
+pytest
