@@ -1,18 +1,13 @@
 #include "Graph.hpp"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <limits>
-#include <queue>
-#include <set>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_set>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -28,7 +23,7 @@ int Graph::addNode(int stopId) {
     int idx = static_cast<int>(nodes.size());
     Node n;
     n.id = stopId;
-    nodes.push_back(std::move(n));
+    nodes.push_back(ds::move(n));
     idToIdx[stopId] = idx;
     return idx;
 }
@@ -39,7 +34,7 @@ int Graph::addEdge(Edge e) {
     int idx = static_cast<int>(edges.size());
     nodes[e.u].out.push_back(idx);
     nodes[e.v].in.push_back(idx);
-    edges.push_back(std::move(e));
+    edges.push_back(ds::move(e));
     return idx;
 }
 
@@ -62,20 +57,20 @@ const Node& Graph::operator[](int stopId) const {
 }
 
 // ───────────────────────── 인접 정보 ─────────────────────────
-std::vector<int> Graph::neighbors(int stopId) const {
-    std::vector<int> res;
+ds::Vector<int> Graph::neighbors(int stopId) const {
+    ds::Vector<int> res;
     int idx = indexOf(stopId);
     if (idx < 0) return res;
-    std::unordered_set<int> seen;
+    ds::HashSet<int> seen;
     for (int ei : nodes[idx].out) {
         int d = edges[ei].dstId;
-        if (seen.insert(d).second) res.push_back(d);
+        if (seen.insert(d)) res.push_back(d);
     }
     return res;
 }
 
-std::vector<int> Graph::edgesBetween(int srcId, int dstId) const {
-    std::vector<int> res;
+ds::Vector<int> Graph::edgesBetween(int srcId, int dstId) const {
+    ds::Vector<int> res;
     int idx = indexOf(srcId);
     if (idx < 0) return res;
     for (int ei : nodes[idx].out)
@@ -83,14 +78,14 @@ std::vector<int> Graph::edgesBetween(int srcId, int dstId) const {
     return res;
 }
 
-std::vector<std::string> Graph::routesAt(int stopId) const {
+ds::Vector<std::string> Graph::routesAt(int stopId) const {
     int idx = indexOf(stopId);
     if (idx < 0) return {};
-    std::set<std::string> s;   // 정렬 + 중복 제거
+    ds::OrderedSet<std::string> s;   // AVL 트리 기반 정렬 + 중복 제거
     const Node& n = nodes[idx];
     for (int ei : n.out) s.insert(edges[ei].routeName);
     for (int ei : n.in) s.insert(edges[ei].routeName);
-    return {s.begin(), s.end()};
+    return s.toSortedVector();
 }
 
 // ───────────────────────── 저장 / 불러오기 ─────────────────────────
@@ -150,10 +145,10 @@ void Graph::writeAdjList(const std::string& path) const {
 }
 
 // ───────────────────────── 탐색 ─────────────────────────
-std::vector<int> Graph::reachable(int srcId) const {
-    std::vector<char> seen(nodes.size(), 0);
-    std::vector<int> res;
-    std::queue<int> q;
+ds::Vector<int> Graph::reachable(int srcId) const {
+    ds::Vector<char> seen(nodes.size(), 0);
+    ds::Vector<int> res;
+    ds::Queue<int> q;
     int s = indexOf(srcId);
     if (s < 0) return res;
     seen[s] = 1;
@@ -175,15 +170,17 @@ PathResult Graph::shortestPath(int srcId, int dstId, double alpha, double defaul
     if (s < 0 || t < 0) return r;
 
     const double INF = std::numeric_limits<double>::infinity();
-    std::vector<double> dist(nodes.size(), INF);
-    std::vector<int> prevEdge(nodes.size(), -1);
-    using Item = std::pair<double, int>;                       // (거리, 노드 인덱스)
-    std::priority_queue<Item, std::vector<Item>, std::greater<Item>> pq;  // 최소 힙
+    ds::Vector<double> dist(nodes.size(), INF);
+    ds::Vector<int> prevEdge(nodes.size(), -1);
+    using Item = ds::Pair<double, int>;                       // (거리, 노드 인덱스)
+    ds::PriorityQueue<Item, ds::Greater<Item>> pq;            // 최소 힙
 
     dist[s] = 0;
     pq.push({0.0, s});
     while (!pq.empty()) {
-        auto [d, u] = pq.top(); pq.pop();
+        Item top = pq.top(); pq.pop();
+        double d = top.first;
+        int u = top.second;
         if (u == t) break;
         if (d > dist[u]) continue;
         for (int ei : nodes[u].out) {
@@ -203,7 +200,7 @@ PathResult Graph::shortestPath(int srcId, int dstId, double alpha, double defaul
 
     r.cost = dist[t];
     for (int cur = t; cur != s; cur = edges[prevEdge[cur]].u) r.edges.push_back(prevEdge[cur]);
-    std::reverse(r.edges.begin(), r.edges.end());
+    ds::reverse(r.edges.begin(), r.edges.end());
     for (int ei : r.edges) r.totalTime += edges[ei].travelTime;
     return r;
 }
@@ -256,7 +253,7 @@ Graph Graph::load(const std::string& path) {
         e.routeId = rd<int32_t>(f); e.routeName = rds(f, path); e.seq = rd<int32_t>(f);
         e.travelTime = rd<double>(f); e.load = rd<double>(f); e.congestion = rd<double>(f);
         if (!f) throw std::runtime_error("corrupted edge data: " + path);
-        g.addEdge(std::move(e));
+        g.addEdge(ds::move(e));
     }
     return g;
 }

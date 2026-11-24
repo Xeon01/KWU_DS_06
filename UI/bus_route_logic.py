@@ -353,6 +353,7 @@ def ensure_pathfinder_binary():
     cached_bin = Path(tempfile.gettempdir()) / f"kwu_ds_06_static_{exe_name}"
     sources = [
         Path(__file__),
+        SEARCH_DIR / "Datastructure.hpp",
         SEARCH_DIR / "Graph.hpp",
         SEARCH_DIR / "Graph.cpp",
         SEARCH_DIR / "Pathfinder.cpp",

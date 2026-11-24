@@ -11,7 +11,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -53,8 +52,10 @@ static void testGraphUnit(const fs::path& tmp) {
     assert(g.neighbors(999).empty());
     assert(g.edgesBetween(999, 200).empty());
     assert(g.routesAt(999).empty());
-    assert(g.neighbors(100) == std::vector<int>({200}));
-    assert(g.routesAt(200) == std::vector<std::string>({"100"}));
+    auto nb = g.neighbors(100);
+    assert(nb.size() == 1 && nb[0] == 200);
+    auto rt = g.routesAt(200);
+    assert(rt.size() == 1 && rt[0] == "100");
 
     // Negative / NaN travelTime edges must be ignored in shortestPath.
     Edge eBadNeg;
@@ -281,6 +282,79 @@ static void testPathfinderCli(const fs::path& tmp, const fs::path& binDir) {
     std::cout << "[PASS] Pathfinder cross-hour CLI tests\n";
 }
 
+static void testDatastructureUnit() {
+    // ds::Vector
+    ds::Vector<int> v;
+    for (int i = 0; i < 40; ++i) v.push_back(i);
+    assert(v.size() == 40 && v.front() == 0 && v.back() == 39);
+    ds::Vector<int> vCopy = v;
+    vCopy.pop_back();
+    assert(v.size() == 40 && vCopy.size() == 39);
+    ds::reverse(vCopy.begin(), vCopy.end());
+    assert(vCopy[0] == 38 && vCopy[38] == 0);
+
+    // ds::Queue (ring buffer wrap-around + growth)
+    ds::Queue<int> q;
+    for (int i = 0; i < 10; ++i) q.push(i);
+    for (int i = 0; i < 6; ++i) { assert(q.front() == i); q.pop(); }
+    for (int i = 10; i < 35; ++i) q.push(i);
+    for (int i = 6; i < 35; ++i) { assert(q.front() == i); q.pop(); }
+    assert(q.empty());
+
+    // ds::PriorityQueue (min-heap)
+    ds::PriorityQueue<int, ds::Greater<int>> minHeap;
+    int vals[] = {7, 2, 9, 1, 5, 3, 8, 4, 6};
+    for (int x : vals) minHeap.push(x);
+    for (int expected = 1; expected <= 9; ++expected) {
+        assert(minHeap.top() == expected);
+        minHeap.pop();
+    }
+    assert(minHeap.empty());
+
+    // ds::HashMap (int & std::string keys, rehash, copy)
+    ds::HashMap<int, int> imap;
+    for (int i = 0; i < 200; ++i) imap[i * 17] = i;
+    for (int i = 0; i < 200; ++i) assert(imap.find(i * 17) != imap.end() && imap[i * 17] == i);
+    ds::HashMap<std::string, int> smap;
+    smap["강남역"] = 1;
+    smap["광운대학교"] = 2;
+    assert(smap.count("강남역") == 1 && smap["광운대학교"] == 2);
+    assert(smap.find("없는정류장") == smap.end());
+
+    // ds::HashSet
+    ds::HashSet<int> hset;
+    assert(hset.insert(10));
+    assert(!hset.insert(10));
+    assert(hset.contains(10) && !hset.contains(20));
+
+    // ds::OrderedSet (AVL tree sorted deduplication)
+    ds::OrderedSet<std::string> oset;
+    oset.insert("470");
+    oset.insert("101");
+    oset.insert("143");
+    oset.insert("101");
+    oset.insert("N13");
+    ds::Vector<std::string> sorted = oset.toSortedVector();
+    assert(sorted.size() == 4);
+    assert(sorted[0] == "101" && sorted[1] == "143" && sorted[2] == "470" && sorted[3] == "N13");
+
+    // ds::stableSort
+    ds::Vector<ds::Pair<int, int>> pairs;
+    pairs.push_back({2, 10});
+    pairs.push_back({1, 20});
+    pairs.push_back({2, 30});
+    pairs.push_back({1, 40});
+    ds::stableSort(pairs.begin(), pairs.end(), [](const ds::Pair<int, int>& a, const ds::Pair<int, int>& b) {
+        return a.first < b.first;
+    });
+    assert(pairs[0].first == 1 && pairs[0].second == 20);
+    assert(pairs[1].first == 1 && pairs[1].second == 40);
+    assert(pairs[2].first == 2 && pairs[2].second == 10);
+    assert(pairs[3].first == 2 && pairs[3].second == 30);
+
+    std::cout << "[PASS] Datastructure.hpp unit tests\n";
+}
+
 int main(int argc, char* argv[]) {
     assert(argc >= 2);
     fs::path binDir = fs::path(argv[1]);
@@ -288,6 +362,7 @@ int main(int argc, char* argv[]) {
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
+    testDatastructureUnit();
     testGraphUnit(tmp);
     testBusEdgeAndCongestionCli(tmp, binDir);
     testPathfinderCli(tmp, binDir);

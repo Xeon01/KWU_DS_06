@@ -1,7 +1,5 @@
 #include "Graph.hpp"
 
-#include <algorithm>
-#include <array>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -10,17 +8,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <iostream>
 #include <limits>
-#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
-#include <tuple>
-#include <unordered_map>
-#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -48,8 +41,8 @@ std::string csvEscape(const std::string& value) {
 }
 
 // 한 줄의 CSV 레코드를 파싱한다 (따옴표 내 쉼표 및 "" 이스케이프 지원).
-std::vector<std::string> parseCsvLine(const std::string& line) {
-    std::vector<std::string> row;
+ds::Vector<std::string> parseCsvLine(const std::string& line) {
+    ds::Vector<std::string> row;
     std::string field;
     bool inQuotes = false;
 
@@ -164,11 +157,11 @@ int hourFromWallSec(long long wallSec) {
 
 // 24개 시간대 그래프의 정류장 ID를 통합 인덱스로 매핑한다.
 struct UnifiedStopIndex {
-    std::unordered_map<int, int> stopToDense;
-    std::vector<int> denseToStop;
-    std::vector<std::array<int, 24>> nodeIdxInHour;
+    ds::HashMap<int, int> stopToDense;
+    ds::Vector<int> denseToStop;
+    ds::Vector<ds::Array<int, 24>> nodeIdxInHour;
 
-    void build(const std::vector<Graph>& graphs) {
+    void build(const ds::Vector<Graph>& graphs) {
         stopToDense.clear();
         denseToStop.clear();
         nodeIdxInHour.clear();
@@ -182,7 +175,7 @@ struct UnifiedStopIndex {
                     dense = static_cast<int>(denseToStop.size());
                     stopToDense[stopId] = dense;
                     denseToStop.push_back(stopId);
-                    std::array<int, 24> arr;
+                    ds::Array<int, 24> arr;
                     arr.fill(-1);
                     nodeIdxInHour.push_back(arr);
                 } else {
@@ -203,8 +196,8 @@ struct UnifiedStopIndex {
 
 // 정류장 ID <-> 이름 매핑 구조체 (stops.csv가 있을 때 활성화, 없으면 ID만 사용)
 struct StopDirectory {
-    std::unordered_map<int, std::string> idToName;
-    std::unordered_map<std::string, std::vector<int>> nameToIds;
+    ds::HashMap<int, std::string> idToName;
+    ds::HashMap<std::string, ds::Vector<int>> nameToIds;
 
     void loadCsv(const std::string& csvPath) {
         std::ifstream f(toFsPath(csvPath), std::ios::binary);
@@ -217,19 +210,19 @@ struct StopDirectory {
                 isFirst = false;
                 if (line.rfind("\xEF\xBB\xBF", 0) == 0) line = line.substr(3);
                 if (line.empty() || line == "\r") continue;
-                std::vector<std::string> cols = parseCsvLine(line);
+                ds::Vector<std::string> cols = parseCsvLine(line);
                 int id = 0;
                 if (cols.empty() || !tryParseInt(cols[0], id)) continue;  // 헤더 스킵
                 if (cols.size() >= 2) {
                     const std::string& name = cols[1];
                     idToName[id] = name;
                     auto& ids = nameToIds[name];
-                    if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+                    if (ds::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
                 }
                 continue;
             }
             if (line.empty() || line == "\r") continue;
-            std::vector<std::string> cols = parseCsvLine(line);
+            ds::Vector<std::string> cols = parseCsvLine(line);
             if (cols.size() < 2) continue;
 
             int id = 0;
@@ -238,27 +231,31 @@ struct StopDirectory {
 
             idToName[id] = name;
             auto& ids = nameToIds[name];
-            if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+            if (ds::find(ids.begin(), ids.end(), id) == ids.end()) {
                 ids.push_back(id);
             }
         }
     }
 
     // 입력이 정수면 해당 ID 단일 목록을, 이름이면 매칭되는 모든 정류장 ID 목록을 반환한다.
-    std::vector<int> resolveAll(const std::string& token) const {
+    ds::Vector<int> resolveAll(const std::string& token) const {
         int id = 0;
-        if (tryParseInt(token, id)) return {id};
+        if (tryParseInt(token, id)) {
+            ds::Vector<int> single;
+            single.push_back(id);
+            return single;
+        }
         auto it = nameToIds.find(token);
         if (it != nameToIds.end()) return it->second;
         return {};
     }
 
     // 시작 시간대(또는 전체 시간대) 그래프에 존재하는 정류장 ID를 우선 선택하고, 동명 정류장이 여러 개면 안내한다.
-    int pickStopId(const std::vector<Graph>& graphs, const UnifiedStopIndex& idx,
+    int pickStopId(const ds::Vector<Graph>& graphs, const UnifiedStopIndex& idx,
                    int startHour, const std::string& token, const char* roleLabel,
                    bool allowAnyHour) const {
-        std::vector<int> candidates = resolveAll(token);
-        std::vector<int> inGraph;
+        ds::Vector<int> candidates = resolveAll(token);
+        ds::Vector<int> inGraph;
         for (int id : candidates) {
             if (graphs[startHour].hasNode(id)) inGraph.push_back(id);
         }
@@ -300,13 +297,27 @@ struct TimeStep {
 struct TimePathResult {
     double cost = -1;
     double totalTime = 0;
-    std::vector<TimeStep> steps;
+    ds::Vector<TimeStep> steps;
     bool found() const { return cost >= 0; }
+};
+
+struct TimeHeapItem {
+    double cost;
+    double elapsed;
+    int dense;
+    int hour;
+
+    bool operator<(const TimeHeapItem& o) const {
+        if (cost != o.cost) return cost < o.cost;
+        if (elapsed != o.elapsed) return elapsed < o.elapsed;
+        if (dense != o.dense) return dense < o.dense;
+        return hour < o.hour;
+    }
 };
 
 // 출발 시각(startHour:startMinute)부터 누적 소요시간에 따라 시간대별 그래프를 일괄 전환하며 최단 경로를 탐색한다.
 // 상태 공간은 (정류장 인덱스, 도착 시간대 0~23)으로 확장하여 시간대 경계 전후의 비-FIFO 전이를 반영한다.
-TimePathResult shortestPathTimeDependent(const std::vector<Graph>& graphs,
+TimePathResult shortestPathTimeDependent(const ds::Vector<Graph>& graphs,
                                            const UnifiedStopIndex& idx,
                                            int srcId, int dstId,
                                            int startHour, int startMinute,
@@ -333,26 +344,29 @@ TimePathResult shortestPathTimeDependent(const std::vector<Graph>& graphs,
     };
 
     const double INF = std::numeric_limits<double>::infinity();
-    std::vector<double> bestCost(S, INF);
-    std::vector<double> bestElapsed(S, INF);
-    std::vector<int> prevDense(S, -1);
-    std::vector<int> prevHour(S, -1);
-    std::vector<int> prevEdge(S, -1);
-    std::vector<double> prevStepDep(S, 0.0);
+    ds::Vector<double> bestCost(S, INF);
+    ds::Vector<double> bestElapsed(S, INF);
+    ds::Vector<int> prevDense(S, -1);
+    ds::Vector<int> prevHour(S, -1);
+    ds::Vector<int> prevEdge(S, -1);
+    ds::Vector<double> prevStepDep(S, 0.0);
 
-    // (누적 비용, 누적 소요시간, 통합 정류장 인덱스, 현재 시간대)
-    using Item = std::tuple<double, double, int, int>;
-    std::priority_queue<Item, std::vector<Item>, std::greater<Item>> pq;
+    // (누적 비용, 누적 소요시간, 통합 정류장 인덱스, 현재 시간대) 최소 힙
+    ds::PriorityQueue<TimeHeapItem, ds::Greater<TimeHeapItem>> pq;
 
     size_t startState = stateIdx(s, startHour);
     bestCost[startState] = 0.0;
     bestElapsed[startState] = 0.0;
-    pq.emplace(0.0, 0.0, s, startHour);
+    pq.emplace(TimeHeapItem{0.0, 0.0, s, startHour});
 
     int endHour = -1;
     while (!pq.empty()) {
-        auto [d, elapsed, u, curHour] = pq.top();
+        TimeHeapItem top = pq.top();
         pq.pop();
+        double d = top.cost;
+        double elapsed = top.elapsed;
+        int u = top.dense;
+        int curHour = top.hour;
 
         size_t uh = stateIdx(u, curHour);
         if (d > bestCost[uh] || (d == bestCost[uh] && elapsed > bestElapsed[uh])) continue;
@@ -386,7 +400,7 @@ TimePathResult shortestPathTimeDependent(const std::vector<Graph>& graphs,
                 prevHour[vh] = curHour;
                 prevEdge[vh] = ei;
                 prevStepDep[vh] = elapsed;
-                pq.emplace(nd, nt, v, nextHour);
+                pq.emplace(TimeHeapItem{nd, nt, v, nextHour});
             }
         }
     }
@@ -412,13 +426,13 @@ TimePathResult shortestPathTimeDependent(const std::vector<Graph>& graphs,
         cur = nextCur;
         curH = nextH;
     }
-    std::reverse(result.steps.begin(), result.steps.end());
+    ds::reverse(result.steps.begin(), result.steps.end());
     return result;
 }
 
 // 00~23시 그래프 24개 로드 (graph_XX.bin 및 graphXX.bin 모두 지원)
-std::vector<Graph> loadAllGraphs(const std::string& folder) {
-    std::vector<Graph> graphs(24);
+ds::Vector<Graph> loadAllGraphs(const std::string& folder) {
+    ds::Vector<Graph> graphs(24);
 
     for (int h = 0; h < 24; ++h) {
         char f1[32], f2[32];
@@ -441,7 +455,7 @@ std::vector<Graph> loadAllGraphs(const std::string& folder) {
 }
 
 // 두 정류장 기준 시간 의존 탐색 결과 출력
-void printPath(const std::vector<Graph>& graphs, const TimePathResult& r, const StopDirectory& dir,
+void printPath(const ds::Vector<Graph>& graphs, const TimePathResult& r, const StopDirectory& dir,
                int startHour, int startMinute, int srcId, int dstId, double alpha) {
     std::printf("\n[%02d:%02d 출발 | %s -> %s | alpha=%.2f]\n",
                 startHour, startMinute,
@@ -514,7 +528,7 @@ void printPath(const std::vector<Graph>& graphs, const TimePathResult& r, const 
 }
 
 // 탐색된 경로를 CSV 파일로 저장 (각 구간이 참조한 시간대 hour 기록, 신규 생성 시 UTF-8 BOM 및 헤더 기록)
-bool savePathToCsv(const std::string& csvPath, const std::vector<Graph>& graphs,
+bool savePathToCsv(const std::string& csvPath, const ds::Vector<Graph>& graphs,
                    const TimePathResult& r, const StopDirectory& dir, double alpha,
                    bool append = true) {
     if (!r.found() && append) return true;
@@ -572,7 +586,7 @@ int main(int argc, char* argv[]) {
     double alpha = 1.0;  // 혼잡도 가중치 기본값
     std::string stopsCsv = "stops.csv";
 
-    std::vector<std::string> posArgs;
+    ds::Vector<std::string> posArgs;
     bool queryMode = false;
     int queryHour = 0;
     int queryMinute = 0;
@@ -625,7 +639,7 @@ int main(int argc, char* argv[]) {
     StopDirectory dir;
     dir.loadCsv(stopsCsv);
 
-    std::vector<Graph> graphs;
+    ds::Vector<Graph> graphs;
     try {
         graphs = loadAllGraphs(folder);
     } catch (const std::exception& ex) {
@@ -641,7 +655,7 @@ int main(int argc, char* argv[]) {
 
     if (queryMode) {
         auto splitTokens = [](const std::string& raw) {
-            std::vector<std::string> out;
+            ds::Vector<std::string> out;
             std::stringstream ss(raw);
             std::string item;
             while (std::getline(ss, item, ',')) {
@@ -650,19 +664,19 @@ int main(int argc, char* argv[]) {
             return out;
         };
 
-        std::vector<std::string> srcTokens = splitTokens(querySrc);
-        std::vector<std::string> dstTokens = splitTokens(queryDst);
-        std::vector<int> srcIds;
-        std::vector<int> dstIds;
+        ds::Vector<std::string> srcTokens = splitTokens(querySrc);
+        ds::Vector<std::string> dstTokens = splitTokens(queryDst);
+        ds::Vector<int> srcIds;
+        ds::Vector<int> dstIds;
         for (const std::string& tok : srcTokens) {
             int id = dir.pickStopId(graphs, stopIndex, queryHour, tok, "시작 정류장", false);
-            if (id >= 0 && std::find(srcIds.begin(), srcIds.end(), id) == srcIds.end()) {
+            if (id >= 0 && ds::find(srcIds.begin(), srcIds.end(), id) == srcIds.end()) {
                 srcIds.push_back(id);
             }
         }
         for (const std::string& tok : dstTokens) {
             int id = dir.pickStopId(graphs, stopIndex, queryHour, tok, "도착 정류장", true);
-            if (id >= 0 && std::find(dstIds.begin(), dstIds.end(), id) == dstIds.end()) {
+            if (id >= 0 && ds::find(dstIds.begin(), dstIds.end(), id) == dstIds.end()) {
                 dstIds.push_back(id);
             }
         }
@@ -677,26 +691,27 @@ int main(int argc, char* argv[]) {
         }
 
         // 우선 입력된 (첫 번째) 정류장 쌍을 탐색하고, 연결 경로가 없으면 인접 후보 쌍 순으로 탐색
-        std::vector<std::pair<size_t, size_t>> pairOrder;
+        ds::Vector<ds::Pair<size_t, size_t>> pairOrder;
         for (size_t i = 0; i < srcIds.size(); ++i) {
             for (size_t j = 0; j < dstIds.size(); ++j) {
                 pairOrder.emplace_back(i, j);
             }
         }
-        std::stable_sort(pairOrder.begin(), pairOrder.end(), [](const auto& a, const auto& b) {
-            return (a.first + a.second) < (b.first + b.second);
-        });
+        ds::stableSort(pairOrder.begin(), pairOrder.end(),
+                       [](const ds::Pair<size_t, size_t>& a, const ds::Pair<size_t, size_t>& b) {
+                           return (a.first + a.second) < (b.first + b.second);
+                       });
 
         int chosenSrc = srcIds[0];
         int chosenDst = dstIds[0];
         TimePathResult fastResult;
-        for (const auto& [si, di] : pairOrder) {
+        for (const auto& p : pairOrder) {
             TimePathResult cand =
-                shortestPathTimeDependent(graphs, stopIndex, srcIds[si], dstIds[di], queryHour, queryMinute, 0.0);
+                shortestPathTimeDependent(graphs, stopIndex, srcIds[p.first], dstIds[p.second], queryHour, queryMinute, 0.0);
             if (cand.found()) {
-                chosenSrc = srcIds[si];
-                chosenDst = dstIds[di];
-                fastResult = std::move(cand);
+                chosenSrc = srcIds[p.first];
+                chosenDst = dstIds[p.second];
+                fastResult = ds::move(cand);
                 break;
             }
         }
