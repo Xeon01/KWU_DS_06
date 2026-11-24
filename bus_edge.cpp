@@ -8,9 +8,71 @@
 #include <filesystem>
 #include <stdexcept>
 #include <utility>
+#include <cmath>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace std;
 namespace fs = std::filesystem;
+
+namespace {
+
+fs::path toFsPath(const string& p) {
+#ifdef _WIN32
+    if (p.empty()) return fs::path();
+    auto convert = [&](UINT cp, DWORD flags) -> wstring {
+        int len = MultiByteToWideChar(cp, flags, p.data(), static_cast<int>(p.size()), nullptr, 0);
+        if (len <= 0) return {};
+        wstring w(static_cast<size_t>(len), L'\0');
+        MultiByteToWideChar(cp, flags, p.data(), static_cast<int>(p.size()), &w[0], len);
+        return w;
+    };
+    wstring w = convert(CP_UTF8, MB_ERR_INVALID_CHARS);
+    if (w.empty()) w = convert(CP_ACP, 0);
+    if (!w.empty()) return fs::path(w);
+#endif
+    return fs::path(p);
+}
+
+string pathToUtf8(const fs::path& p) {
+#ifdef _WIN32
+    wstring w = p.wstring();
+    if (w.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return p.string();
+    string out(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &out[0], len, nullptr, nullptr);
+    return out;
+#else
+    return p.string();
+#endif
+}
+
+bool tryParseInt(const string& token, int& out) {
+    if (token.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    long val = strtol(token.c_str(), &end, 10);
+    if (errno == ERANGE || end == token.c_str() || *end != '\0') return false;
+    if (val < INT_MIN || val > INT_MAX) return false;
+    out = static_cast<int>(val);
+    return true;
+}
+
+string normalizeSeq(const string& token) {
+    int val = 0;
+    return tryParseInt(token, val) ? to_string(val) : token;
+}
+
+} // namespace
 
 using Row = vector<string>;
 
@@ -147,17 +209,28 @@ public:
         return false;
     }
 
-    const string& get(
-        const Row& row,
-        const string& column
-    ) const {
+    size_t indexOf(const string& column) const {
         auto it = columnIndex.find(column);
 
         if (it == columnIndex.end()) {
             throw runtime_error("없는 열 이름: " + column);
         }
 
-        return row.at(it->second);
+        return it->second;
+    }
+
+    const string& get(
+        const Row& row,
+        const string& column
+    ) const {
+        return row.at(indexOf(column));
+    }
+
+    const string& get(
+        const Row& row,
+        size_t idx
+    ) const {
+        return row.at(idx);
     }
 };
 
@@ -202,7 +275,7 @@ string normalizeTime(const string& value) {
     size_t parsed = 0;
     double number = stod(value, &parsed);
 
-    if (parsed != value.size() || number < 0) {
+    if (parsed != value.size() || !isfinite(number) || number < 0) {
         throw runtime_error("잘못된 운행시간: " + value);
     }
 
@@ -213,20 +286,20 @@ int main(int argc, char* argv[]) {
     try {
         // 인자가 없으면 현재 작업 폴더에서 CSV를 읽는다.
         fs::path folder =
-            argc >= 2 ? fs::u8path(argv[1]) : fs::current_path();
+            argc >= 2 ? toFsPath(argv[1]) : fs::current_path();
 
         fs::path routePath =
-            folder / fs::u8path(
+            folder / toFsPath(
                 "서울시버스노선ID정보(20260902).csv"
             );
 
         fs::path stopPath =
-            folder / fs::u8path(
+            folder / toFsPath(
                 "서울시버스노선별정류소정보(20260902).csv"
             );
 
         fs::path timePath =
-            folder / fs::u8path(
+            folder / toFsPath(
                 "tpss_route_section_speedh_2026.09.14-09.20.csv"
             );
 
@@ -247,27 +320,40 @@ int main(int argc, char* argv[]) {
         // 1. 노선 정보 읽기
         {
             CsvReader reader(routePath);
+            size_t cRouteId = reader.indexOf("ROUTEID");
+            size_t cRouteName = reader.indexOf("노선명");
 
             while (reader.next(row)) {
-                routeNames[reader.get(row, "ROUTEID")] =
-                    reader.get(row, "노선명");
+                routeNames[reader.get(row, cRouteId)] =
+                    reader.get(row, cRouteName);
             }
         }
 
         // 2. 정류장 정보 읽기
         {
             CsvReader reader(stopPath);
+            size_t cRouteId = reader.indexOf("ROUTE_ID");
+            size_t cStopId = reader.indexOf("NODE_ID");
+            size_t cSeq = reader.indexOf("순번");
+            size_t cStopName = reader.indexOf("정류소명");
+            size_t cX = reader.indexOf("X좌표");
+            size_t cY = reader.indexOf("Y좌표");
+            size_t cRouteName = reader.indexOf("노선명");
 
             while (reader.next(row)) {
-                string routeId = reader.get(row, "ROUTE_ID");
-                string stopId = reader.get(row, "NODE_ID");
-                int sequence = stoi(reader.get(row, "순번"));
+                string routeId = reader.get(row, cRouteId);
+                string stopId = reader.get(row, cStopId);
+                const string& seqStr = reader.get(row, cSeq);
+                int sequence = 0;
+                if (!tryParseInt(seqStr, sequence)) {
+                    throw runtime_error("잘못된 정류장 순번: " + seqStr);
+                }
 
                 stops[stopId] = {
                     stopId,
-                    reader.get(row, "정류소명"),
-                    reader.get(row, "X좌표"),
-                    reader.get(row, "Y좌표")
+                    reader.get(row, cStopName),
+                    reader.get(row, cX),
+                    reader.get(row, cY)
                 };
 
                 routeStops[routeId][sequence] = stopId;
@@ -275,7 +361,7 @@ int main(int argc, char* argv[]) {
                 // 노선 ID 파일에 없으면 정류장 파일의 노선명 사용
                 if (routeNames.find(routeId) == routeNames.end()) {
                     routeNames[routeId] =
-                        reader.get(row, "노선명");
+                        reader.get(row, cRouteName);
                 }
             }
         }
@@ -412,27 +498,40 @@ int main(int argc, char* argv[]) {
         // 5. 운행시간 데이터와 정류장·노선 정보를 결합
         {
             CsvReader reader(timePath);
+            size_t cRouteId = reader.indexOf("노선_ID");
+            size_t cFromId = reader.indexOf("출발_정류장_ID");
+            size_t cToId = reader.indexOf("도착_정류장_ID");
+            size_t cFromSeq = reader.indexOf("출발_정류장_순서");
+            size_t cToSeq = reader.indexOf("도착_정류장_순서");
+            size_t cDate = reader.indexOf("기준_날짜");
+
+            vector<size_t> timeColIndices;
+            timeColIndices.reserve(sourceTimeColumns.size());
+            for (const string& column : sourceTimeColumns) {
+                timeColIndices.push_back(reader.indexOf(column));
+            }
 
             while (reader.next(row)) {
                 EdgeKey key = {
-                    reader.get(row, "노선_ID"),
-                    reader.get(row, "출발_정류장_ID"),
-                    reader.get(row, "도착_정류장_ID"),
-                    reader.get(row, "출발_정류장_순서"),
-                    reader.get(row, "도착_정류장_순서")
+                    reader.get(row, cRouteId),
+                    reader.get(row, cFromId),
+                    reader.get(row, cToId),
+                    normalizeSeq(reader.get(row, cFromSeq)),
+                    normalizeSeq(reader.get(row, cToSeq))
                 };
 
                 Row times;
+                times.reserve(timeColIndices.size());
 
-                for (const string& column : sourceTimeColumns) {
+                for (size_t colIdx : timeColIndices) {
                     times.push_back(
-                        normalizeTime(reader.get(row, column))
+                        normalizeTime(reader.get(row, colIdx))
                     );
                 }
 
                 writeEdge(
                     key,
-                    reader.get(row, "기준_날짜"),
+                    reader.get(row, cDate),
                     times
                 );
 
@@ -473,7 +572,7 @@ int main(int argc, char* argv[]) {
         }
 
         cout << "생성 완료: "
-            << outputPath.string() << '\n';
+            << pathToUtf8(outputPath) << '\n';
         cout << "데이터 행 수: " << outputCount << '\n';
         cout << "열 수: " << header.size() << '\n';
     }
