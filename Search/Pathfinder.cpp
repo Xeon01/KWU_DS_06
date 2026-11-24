@@ -367,6 +367,7 @@ TimePathResult shortestPathTimeDependent(const std::vector<Graph>& graphs,
         const Graph& gCur = graphs[curHour];
         for (int ei : gCur.nodeAt(uInHour).out) {
             const Edge& e = gCur.edge(ei);
+            if (!e.hasData()) continue;  // 미운행/혼잡도 미집계 간선은 탐색하지 않음
             if (!std::isfinite(e.travelTime) || e.travelTime < 0.0) continue;
             double stepCost = e.cost(alpha);
             if (!std::isfinite(stepCost) || stepCost < 0.0) continue;
@@ -514,19 +515,25 @@ void printPath(const std::vector<Graph>& graphs, const TimePathResult& r, const 
 
 // 탐색된 경로를 CSV 파일로 저장 (각 구간이 참조한 시간대 hour 기록, 신규 생성 시 UTF-8 BOM 및 헤더 기록)
 bool savePathToCsv(const std::string& csvPath, const std::vector<Graph>& graphs,
-                   const TimePathResult& r, const StopDirectory& dir, double alpha) {
-    if (!r.found()) return true;
+                   const TimePathResult& r, const StopDirectory& dir, double alpha,
+                   bool append = true) {
+    if (!r.found() && append) return true;
 
     std::error_code ec;
     fs::path p = toFsPath(csvPath);
-    bool writeHeader = !fs::exists(p, ec) || fs::file_size(p, ec) == 0;
-    std::ofstream f(p, std::ios::binary | std::ios::app);
+    bool writeHeader = !append || !fs::exists(p, ec) || fs::file_size(p, ec) == 0;
+    std::ios::openmode mode = std::ios::binary | (append ? std::ios::app : std::ios::trunc);
+    std::ofstream f(p, mode);
     if (!f) return false;
 
     if (writeHeader) {
         f.write("\xEF\xBB\xBF", 3);
         f << "hour,alpha,step,route_id,route_name,src_id,src_name,dst_id,dst_name,"
              "travel_time,load,congestion,step_cost,is_transfer\n";
+    }
+    if (!r.found()) {
+        f.flush();
+        return static_cast<bool>(f);
     }
 
     int prevRouteId = -1;
@@ -561,11 +568,47 @@ int main(int argc, char* argv[]) {
     SetConsoleCP(CP_UTF8);
 #endif
 
-    std::string folder = (argc >= 2) ? argv[1] : resolveDefaultGraphFolder();
-
+    std::string folder = resolveDefaultGraphFolder();
     double alpha = 1.0;  // 혼잡도 가중치 기본값
-    if (argc >= 3) {
-        std::string alphaArg = argv[2];
+    std::string stopsCsv = "stops.csv";
+
+    std::vector<std::string> posArgs;
+    bool queryMode = false;
+    int queryHour = 0;
+    int queryMinute = 0;
+    std::string querySrc;
+    std::string queryDst;
+    std::string queryOutCsv = "path_results.csv";
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--query") {
+            if (i + 4 >= argc) {
+                std::cerr << "[오류] --query 사용법: --query <시(0~23)> <분(0~59)> <시작정류장> <도착정류장> [출력CSV]\n";
+                return 1;
+            }
+            if (!tryParseInt(argv[++i], queryHour) || queryHour < 0 || queryHour >= 24) {
+                std::cerr << "[오류] 잘못된 시(0~23) 값입니다.\n";
+                return 1;
+            }
+            if (!tryParseInt(argv[++i], queryMinute) || queryMinute < 0 || queryMinute >= 60) {
+                std::cerr << "[오류] 잘못된 분(0~59) 값입니다.\n";
+                return 1;
+            }
+            querySrc = argv[++i];
+            queryDst = argv[++i];
+            if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) {
+                queryOutCsv = argv[++i];
+            }
+            queryMode = true;
+        } else {
+            posArgs.push_back(arg);
+        }
+    }
+
+    if (posArgs.size() >= 1) folder = posArgs[0];
+    if (posArgs.size() >= 2) {
+        const std::string& alphaArg = posArgs[1];
         try {
             size_t parsed = 0;
             alpha = std::stod(alphaArg, &parsed);
@@ -577,8 +620,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-
-    std::string stopsCsv = (argc >= 4) ? argv[3] : "stops.csv";
+    if (posArgs.size() >= 3) stopsCsv = posArgs[2];
 
     StopDirectory dir;
     dir.loadCsv(stopsCsv);
@@ -589,12 +631,92 @@ int main(int argc, char* argv[]) {
     } catch (const std::exception& ex) {
         std::cerr << "[오류] " << ex.what() << "\n"
                   << "사용법: " << argv[0]
-                  << " [그래프폴더=graphs] [alpha=1.0] [정류장CSV=stops.csv]\n";
+                  << " [그래프폴더=graphs] [alpha=1.0] [정류장CSV=stops.csv]"
+                  << " [--query 시 분 시작정류장 도착정류장 [출력CSV]]\n";
         return 1;
     }
 
     UnifiedStopIndex stopIndex;
     stopIndex.build(graphs);
+
+    if (queryMode) {
+        auto splitTokens = [](const std::string& raw) {
+            std::vector<std::string> out;
+            std::stringstream ss(raw);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                if (!item.empty()) out.push_back(item);
+            }
+            return out;
+        };
+
+        std::vector<std::string> srcTokens = splitTokens(querySrc);
+        std::vector<std::string> dstTokens = splitTokens(queryDst);
+        std::vector<int> srcIds;
+        std::vector<int> dstIds;
+        for (const std::string& tok : srcTokens) {
+            int id = dir.pickStopId(graphs, stopIndex, queryHour, tok, "시작 정류장", false);
+            if (id >= 0 && std::find(srcIds.begin(), srcIds.end(), id) == srcIds.end()) {
+                srcIds.push_back(id);
+            }
+        }
+        for (const std::string& tok : dstTokens) {
+            int id = dir.pickStopId(graphs, stopIndex, queryHour, tok, "도착 정류장", true);
+            if (id >= 0 && std::find(dstIds.begin(), dstIds.end(), id) == dstIds.end()) {
+                dstIds.push_back(id);
+            }
+        }
+
+        if (srcIds.empty()) {
+            std::cerr << "[오류] 시작 정류장(" << querySrc << ")이 " << queryHour << "시 그래프에 존재하지 않습니다.\n";
+            return 1;
+        }
+        if (dstIds.empty()) {
+            std::cerr << "[오류] 도착 정류장(" << queryDst << ")이 그래프에 존재하지 않습니다.\n";
+            return 1;
+        }
+
+        // 우선 입력된 (첫 번째) 정류장 쌍을 탐색하고, 연결 경로가 없으면 인접 후보 쌍 순으로 탐색
+        std::vector<std::pair<size_t, size_t>> pairOrder;
+        for (size_t i = 0; i < srcIds.size(); ++i) {
+            for (size_t j = 0; j < dstIds.size(); ++j) {
+                pairOrder.emplace_back(i, j);
+            }
+        }
+        std::stable_sort(pairOrder.begin(), pairOrder.end(), [](const auto& a, const auto& b) {
+            return (a.first + a.second) < (b.first + b.second);
+        });
+
+        int chosenSrc = srcIds[0];
+        int chosenDst = dstIds[0];
+        TimePathResult fastResult;
+        for (const auto& [si, di] : pairOrder) {
+            TimePathResult cand =
+                shortestPathTimeDependent(graphs, stopIndex, srcIds[si], dstIds[di], queryHour, queryMinute, 0.0);
+            if (cand.found()) {
+                chosenSrc = srcIds[si];
+                chosenDst = dstIds[di];
+                fastResult = std::move(cand);
+                break;
+            }
+        }
+
+        printPath(graphs, fastResult, dir, queryHour, queryMinute, chosenSrc, chosenDst, 0.0);
+        if (!savePathToCsv(queryOutCsv, graphs, fastResult, dir, 0.0, false)) {
+            std::cerr << "[오류] 결과 CSV 저장 실패: " << queryOutCsv << '\n';
+            return 1;
+        }
+        if (alpha > 0.0) {
+            TimePathResult comfyResult =
+                shortestPathTimeDependent(graphs, stopIndex, chosenSrc, chosenDst, queryHour, queryMinute, alpha);
+            printPath(graphs, comfyResult, dir, queryHour, queryMinute, chosenSrc, chosenDst, alpha);
+            if (!savePathToCsv(queryOutCsv, graphs, comfyResult, dir, alpha, true)) {
+                std::cerr << "[오류] 결과 CSV 저장 실패: " << queryOutCsv << '\n';
+                return 1;
+            }
+        }
+        return 0;
+    }
 
     std::cout << "00~23시 그래프 24개 로드 완료 (폴더: " << pathToUtf8(folder)
               << ", 통합 정류장: " << stopIndex.denseToStop.size()
