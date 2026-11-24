@@ -1,8 +1,12 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
+#include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -12,9 +16,69 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+namespace {
+
+std::filesystem::path toFsPath(const std::string& p) {
+#ifdef _WIN32
+    if (p.empty()) return std::filesystem::path();
+    auto convert = [&](UINT cp, DWORD flags) -> std::wstring {
+        int len = MultiByteToWideChar(cp, flags, p.data(), static_cast<int>(p.size()), nullptr, 0);
+        if (len <= 0) return {};
+        std::wstring w(static_cast<size_t>(len), L'\0');
+        MultiByteToWideChar(cp, flags, p.data(), static_cast<int>(p.size()), &w[0], len);
+        return w;
+    };
+    std::wstring w = convert(CP_UTF8, MB_ERR_INVALID_CHARS);
+    if (w.empty()) w = convert(CP_ACP, 0);
+    if (!w.empty()) return std::filesystem::path(w);
+#endif
+    return std::filesystem::path(p);
+}
+
+bool tryParseInt(const std::string& token, int& out) {
+    if (token.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    long val = std::strtol(token.c_str(), &end, 10);
+    if (errno == ERANGE || end == token.c_str() || *end != '\0') return false;
+    if (val < INT_MIN || val > INT_MAX) return false;
+    out = static_cast<int>(val);
+    return true;
+}
+
+bool tryParseDouble(const std::string& token, double& out) {
+    if (token.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    double val = std::strtod(token.c_str(), &end);
+    if (errno == ERANGE || end == token.c_str() || *end != '\0' || !std::isfinite(val)) return false;
+    out = val;
+    return true;
+}
+
+std::string csvEscape(const std::string& value) {
+    if (value.find_first_of(",\"\r\n") == std::string::npos) return value;
+    std::string out = "\"";
+    for (char ch : value) {
+        if (ch == '"') out += "\"\"";
+        else out += ch;
+    }
+    out += '"';
+    return out;
+}
+
+}  // namespace
+
 class CsvReader {
 public:
-    explicit CsvReader(const std::string& path) : in_(path, std::ios::binary) {
+    explicit CsvReader(const std::string& path) : in_(toFsPath(path), std::ios::binary) {
         if (!in_) throw std::runtime_error("cannot open: " + path);
         std::vector<std::string> header;
         if (!next(header)) throw std::runtime_error("empty file: " + path);
@@ -33,7 +97,7 @@ public:
             if (i == line.size()) {
                 if (quoted) {
                     std::string more;
-                    if (!std::getline(in_, more)) break;
+                    if (!std::getline(in_, more)) throw std::runtime_error("unclosed CSV quote");
                     field += '\n';
                     line += '\n' + more;
                     continue;
@@ -46,7 +110,7 @@ public:
                     if (i + 1 < line.size() && line[i + 1] == '"') { field += '"'; ++i; }
                     else quoted = false;
                 } else field += c;
-            } else if (c == '"') quoted = true;
+            } else if (c == '"' && field.empty()) quoted = true;
             else if (c == ',') { row.push_back(field); field.clear(); }
             else if (c != '\r') field += c;
         }
@@ -105,7 +169,7 @@ public:
     }
 
     std::vector<std::string> match(const std::string& name) const {
-        if (auto it = byNorm_.find(name); it != byNorm_.end()) return it->second;
+        if (auto it = byNorm_.find(strip0(name)); it != byNorm_.end()) return it->second;
 
         std::vector<std::string> out;
         for (const auto& [k, rs] : byNorm_)
@@ -114,8 +178,14 @@ public:
         if (!out.empty()) { std::sort(out.begin(), out.end()); return out; }
 
         const std::string* best = nullptr;
-        for (const auto& [k, rs] : byNorm_)
-            if (utf8Len(k) >= 3 && startsWith(name, k) && (!best || k.size() > best->size())) best = &k;
+        for (const auto& [k, rs] : byNorm_) {
+            if (utf8Len(k) >= 3 && startsWith(name, k) &&
+                !(std::isdigit(static_cast<unsigned char>(k.back())) && name.size() > k.size() &&
+                  std::isdigit(static_cast<unsigned char>(name[k.size()]))) &&
+                (!best || k.size() > best->size())) {
+                best = &k;
+            }
+        }
         if (best) return byNorm_.at(*best);
 
         for (const std::string suf : {"출근", "퇴근"}) {
@@ -149,13 +219,21 @@ struct RideData {
 std::vector<EdgeRow> readEdges(const std::string& path) {
     CsvReader r(path);
     int cR = r.col("노선_ID"), cN = r.col("노선명"), cS = r.col("출발_정류장_ID"), cD = r.col("도착_정류장_ID"),
-        cSq = r.col("출발_정류장_순서"), cDq = r.col("도착_정류장_순서"), cT = r.col("기본_이동시간_초");
+        cSq = r.col("출발_정류장_순서"), cDq = r.col("도착_정류장_순서");
+    int cT = r.hasCol("기본_이동시간_초") ? r.col("기본_이동시간_초") : r.col("이동시간_s");
+    int maxCol = std::max({cR, cN, cS, cD, cSq, cDq, cT});
     std::vector<EdgeRow> rows;
     std::vector<std::string> f;
     while (r.next(f)) {
-        if (f.size() < r.header().size()) continue;
-        rows.push_back({std::stoi(f[cR]), std::stoi(f[cS]), std::stoi(f[cD]),
-                        std::stoi(f[cSq]), std::stoi(f[cDq]), f[cN], std::stod(f[cT])});
+        if (f.size() <= static_cast<size_t>(maxCol)) continue;
+        int rid = 0, sid = 0, did = 0, sseq = 0, dseq = 0;
+        if (!tryParseInt(f[cR], rid) || !tryParseInt(f[cS], sid) || !tryParseInt(f[cD], did) ||
+            !tryParseInt(f[cSq], sseq) || !tryParseInt(f[cDq], dseq)) {
+            continue;
+        }
+        double tt = 0.0;
+        if (!f[cT].empty() && !tryParseDouble(f[cT], tt)) continue;
+        rows.push_back({rid, sid, did, sseq, dseq, f[cN], tt});
     }
     return rows;
 }
@@ -163,26 +241,43 @@ std::vector<EdgeRow> readEdges(const std::string& path) {
 RideData readRidership(const std::string& path) {
     CsvReader r(path);
     int cY = r.col("사용년월"), cR = r.col("노선번호"), cS = r.col("표준버스정류장ID");
+    int maxCol = std::max({cY, cR, cS});
     std::array<int, H> cb, ca;
     for (int h = 0; h < H; ++h) {
-        std::string hh = h == 0 ? "00" : std::to_string(h);
-        cb[h] = r.col(hh + "시승차총승객수");
-        ca[h] = r.col(hh + "시하차총승객수");
+        char buf2[4];
+        std::snprintf(buf2, sizeof buf2, "%02d", h);
+        std::string hh2(buf2);
+        std::string hh1 = std::to_string(h);
+        std::string bCol = r.hasCol(hh2 + "시승차총승객수") ? (hh2 + "시승차총승객수") : (hh1 + "시승차총승객수");
+        std::string aCol = r.hasCol(hh2 + "시하차총승객수") ? (hh2 + "시하차총승객수") : (hh1 + "시하차총승객수");
+        cb[h] = r.col(bCol);
+        ca[h] = r.col(aCol);
+        maxCol = std::max({maxCol, cb[h], ca[h]});
     }
     RideData d;
     std::string ym;
     std::unordered_set<std::string> routeSet;
     std::vector<std::string> f;
     while (r.next(f)) {
-        if (f.size() <= static_cast<size_t>(std::max(cb[H - 1], ca[H - 1]))) continue;
+        if (f.size() <= static_cast<size_t>(maxCol)) continue;
+        int stopId = 0;
+        if (!tryParseInt(f[cS], stopId)) continue;
         if (ym.empty()) ym = f[cY];
         const std::string& route = f[cR];
-        auto& [B, A] = d.onoff[route][std::stoi(f[cS])];
-        for (int h = 0; h < H; ++h) { B[h] += std::stod(f[cb[h]]); A[h] += std::stod(f[ca[h]]); }
+        auto& [B, A] = d.onoff[route][stopId];
+        for (int h = 0; h < H; ++h) {
+            double bv = 0.0, av = 0.0;
+            if (!f[cb[h]].empty() && tryParseDouble(f[cb[h]], bv)) B[h] += bv;
+            if (!f[ca[h]].empty() && tryParseDouble(f[ca[h]], av)) A[h] += av;
+        }
         if (routeSet.insert(route).second) d.routes.push_back(route);
     }
     std::sort(d.routes.begin(), d.routes.end());
-    if (ym.size() >= 6) d.days = daysInMonth(std::stoi(ym.substr(0, 4)), std::stoi(ym.substr(4, 2)));
+    int y = 0, m = 0;
+    if (ym.size() >= 6 && tryParseInt(ym.substr(0, 4), y) && tryParseInt(ym.substr(4, 2), m) &&
+        m >= 1 && m <= 12) {
+        d.days = daysInMonth(y, m);
+    }
     return d;
 }
 
@@ -258,8 +353,8 @@ LoadResult computeLoads(const std::vector<EdgeRow>& edges, const RideData& ride)
         for (size_t i = 0; i < n; ++i) {
             Hours l;
             for (int h = 0; h < H; ++h) {
-                cum[h] += B[i][h] - A[i][h];
-                l[h] = std::max(cum[h], 0.0) / ride.days;
+                cum[h] = std::max(cum[h] + B[i][h] - A[i][h], 0.0);
+                l[h] = cum[h] / ride.days;
             }
             seqLoad[order[i]] = l;
         }
@@ -278,6 +373,7 @@ LoadResult computeLoads(const std::vector<EdgeRow>& edges, const RideData& ride)
 }
 
 double percentile(std::vector<double> v, double p) {
+    if (v.empty()) return 0.0;
     std::sort(v.begin(), v.end());
     double pos = p / 100.0 * (v.size() - 1);
     size_t lo = static_cast<size_t>(std::floor(pos)), hi = std::min(lo + 1, v.size() - 1);
@@ -285,41 +381,51 @@ double percentile(std::vector<double> v, double p) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::cerr << "usage: " << argv[0] << " <bus_edges.csv> <ridership.csv> [out=congestion.csv]\n";
-        return 1;
-    }
-    auto edges = readEdges(argv[1]);
-    auto ride = readRidership(argv[2]);
-    auto L = computeLoads(edges, ride);
+    try {
+        if (argc < 3) {
+            std::cerr << "usage: " << argv[0] << " <bus_edges.csv> <ridership.csv> [out=congestion.csv]\n";
+            return 1;
+        }
+        auto edges = readEdges(argv[1]);
+        auto ride = readRidership(argv[2]);
+        auto L = computeLoads(edges, ride);
 
-    std::vector<double> vals;
-    for (auto& row : L.load)
-        for (double x : row)
-            if (!std::isnan(x) && x > 0) vals.push_back(x);
-    double cap = percentile(vals, CAP_PERCENTILE);
+        std::vector<double> vals;
+        for (auto& row : L.load)
+            for (double x : row)
+                if (!std::isnan(x) && x > 0) vals.push_back(x);
+        double cap = percentile(vals, CAP_PERCENTILE);
+        if (cap <= 0.0) cap = 1.0;
 
-    std::ofstream out(argc > 3 ? argv[3] : "congestion.csv", std::ios::binary);
-    out << "\xEF\xBB\xBF" << "route_id,route_name,src_id,dst_id,src_seq";
-    for (int h = 0; h < H; ++h) {
-        char buf[8];
-        std::snprintf(buf, sizeof buf, ",c%02d", h);
-        out << buf;
-    }
-    out << '\n';
-    for (size_t i = 0; i < edges.size(); ++i) {
-        const EdgeRow& e = edges[i];
-        out << e.routeId << ',' << e.routeName << ',' << e.srcId << ',' << e.dstId << ',' << e.srcSeq;
+        std::string outPath = argc > 3 ? argv[3] : "congestion.csv";
+        std::ofstream out(toFsPath(outPath), std::ios::binary);
+        if (!out) throw std::runtime_error("cannot write: " + outPath);
+        out << "\xEF\xBB\xBF" << "route_id,route_name,src_id,dst_id,src_seq";
         for (int h = 0; h < H; ++h) {
-            out << ',';
-            double l = L.load[i][h];
-            if (!std::isnan(l)) {
-                char buf[16];
-                std::snprintf(buf, sizeof buf, "%.4f", std::min(std::max(l / cap, 0.0), 1.0));
-                out << buf;
-            }
+            char buf[8];
+            std::snprintf(buf, sizeof buf, ",c%02d", h);
+            out << buf;
         }
         out << '\n';
+        for (size_t i = 0; i < edges.size(); ++i) {
+            const EdgeRow& e = edges[i];
+            out << e.routeId << ',' << csvEscape(e.routeName) << ',' << e.srcId << ',' << e.dstId << ',' << e.srcSeq;
+            for (int h = 0; h < H; ++h) {
+                out << ',';
+                double l = L.load[i][h];
+                if (!std::isnan(l)) {
+                    char buf[16];
+                    std::snprintf(buf, sizeof buf, "%.4f", std::min(std::max(l / cap, 0.0), 1.0));
+                    out << buf;
+                }
+            }
+            out << '\n';
+        }
+        out.flush();
+        if (!out) throw std::runtime_error("write error: " + outPath);
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "error: " << e.what() << '\n';
+        return 1;
     }
-    return 0;
 }
