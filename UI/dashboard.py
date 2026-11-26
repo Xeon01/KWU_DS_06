@@ -356,7 +356,7 @@ def render_search_results(result, stops):
                 selected_route["title"],
             )
             render_congestion_legend()
-            st.caption("지도에는 선택한 경로의 구간별 혼잡도를 20% 단위 색상으로 표시합니다.")
+            st.caption("구간별 혼잡도 표시")
 
     with detail_col:
         st.subheader("경로 상세", anchor=False)
