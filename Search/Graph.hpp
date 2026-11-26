@@ -26,6 +26,11 @@ struct Edge {
         double c = hasData() ? congestion : defaultCongestion;
         return travelTime * (1.0 + alpha * c);
     }
+    // 극단적 혼잡 회피 가중치 = 혼잡도 × 이동시간
+    double extremeCost(double defaultCongestion = 0.0) const {
+        double c = hasData() ? congestion : defaultCongestion;
+        return c * travelTime;
+    }
 };
 
 struct Node {

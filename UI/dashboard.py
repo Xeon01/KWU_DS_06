@@ -3,6 +3,7 @@ from datetime import datetime
 import folium
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_folium import st_folium
 from bus_route_logic import (
     CONGESTION_COLOR_BANDS,
@@ -212,16 +213,25 @@ def render_search_results(result, stops):
             "혼잡 회피 경로",
             result["less_crowded_path"],
             "혼잡 회피",
-            f"Pathfinder(alpha={result.get('alpha', CONGESTION_WEIGHT):.1f}) · 이동 시간과 혼잡도를 함께 반영한 경로",
+            f"이동 시간과 혼잡도를 함께 반영한 경로",
+            False,
         ),
         (
             "최단 시간 경로",
             result["shortest_path"],
             "최단 시간",
-            "Pathfinder(alpha=0.0) · 시간대 전환을 반영한 최단 소요시간 경로",
+            "시간대 전환을 반영한 최단 소요시간 경로",
+            False,
+        ),
+        (
+            "극단적 회피 경로",
+            result.get("extreme_path"),
+            "극단적 회피",
+            "혼잡도×시간 비용만 최소화한 경로 (소요시간이 크게 늘어날 수 있음)",
+            True,
         ),
     ]
-    for title, path, badge, description in possible_routes:
+    for title, path, badge, description, is_extreme in possible_routes:
         if path is None:
             continue
         summary = path_summary(path)
@@ -235,6 +245,8 @@ def render_search_results(result, stops):
             "path": path,
             "badge": badge,
             "description": description,
+            "is_extreme": is_extreme,
+            "minutes": summary["minutes"],
             "congestion": summary["congestion"],
             "congestion_text": congestion_text,
         })
@@ -251,13 +263,21 @@ def render_search_results(result, stops):
         len(known_congestion) >= 2
         and max(known_congestion) - min(known_congestion) > 0.000001
     )
+    min_congestion = min(known_congestion) if known_congestion else None
+    max_congestion = max(known_congestion) if known_congestion else None
     route_choices = {}
     for route in route_items:
         congestion = route["congestion"]
         if congestion_is_different and congestion is not None:
-            is_less_crowded = congestion == min(known_congestion)
-            route_color = "#16A34A" if is_less_crowded else "#DC2626"
-            traffic_label = "혼잡도 낮음" if is_less_crowded else "혼잡도 높음"
+            if abs(congestion - min_congestion) <= 1e-6:
+                route_color = "#16A34A"
+                traffic_label = "혼잡도 낮음"
+            elif abs(congestion - max_congestion) <= 1e-6:
+                route_color = "#DC2626"
+                traffic_label = "혼잡도 높음"
+            else:
+                route_color = "#FCA311"
+                traffic_label = "혼잡도 중간"
         elif len(route_items) > 1:
             route_color = "#FCA311"
             traffic_label = (
@@ -270,7 +290,7 @@ def render_search_results(result, stops):
             traffic_label = "비교할 다른 경로가 없습니다"
 
         option_label = (
-            f"{traffic_label} · {route['title']} · {route['congestion_text']}"
+            f"{traffic_label} · {route['title']} · {route['minutes']:.0f}분 · {route['congestion_text']}"
         )
         route["color"] = route_color
         route_choices[option_label] = route
@@ -278,8 +298,12 @@ def render_search_results(result, stops):
     route_options = list(route_choices)
     default_index = 0
     best_congestion = None
-    for idx, option_label in enumerate(route_options):
-        cong = route_choices[option_label]["congestion"]
+    standard_indices = [
+        idx for idx, label in enumerate(route_options)
+        if not route_choices[label]["is_extreme"]
+    ]
+    for idx in (standard_indices or range(len(route_options))):
+        cong = route_choices[route_options[idx]]["congestion"]
         if cong is not None and (best_congestion is None or cong < best_congestion):
             best_congestion = cong
             default_index = idx
@@ -333,6 +357,38 @@ def render_crowded_stops(hour, stops):
         lambda value: f"{value:.1f}%"
     )
     st.table(table)
+
+
+def scroll_to_results(trigger_seq):
+    """여정 입력 완료 후 검색 결과('경로 선택') 위치로 부드럽게 스크롤한다."""
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            // scroll trigger #{trigger_seq}
+            try {{
+                const doc = window.parent.document;
+                const doScroll = () => {{
+                    const headings = doc.querySelectorAll("h2");
+                    const target = Array.from(headings).find(
+                        (el) => el.textContent && el.textContent.trim().includes("경로 선택")
+                    );
+                    if (target) {{
+                        target.style.scrollMarginTop = "4rem";
+                        target.scrollIntoView({{ behavior: "smooth", block: "start" }});
+                    }}
+                }};
+                window.parent.requestAnimationFrame(() => {{
+                    setTimeout(doScroll, 120);
+                }});
+            }} catch (e) {{
+                // 부모 DOM 접근이 제한된 환경에서는 무시
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 
 
 def main():
@@ -460,6 +516,7 @@ def main():
                 use_container_width=True,
             )
 
+    should_scroll_to_results = False
     if search_clicked:
         st.session_state.pop("search_result", None)
         if not start_id or not end_id:
@@ -480,7 +537,7 @@ def main():
                 actual_start_id = paths.get("actual_start_id", start_id)
                 actual_end_id = paths.get("actual_end_id", end_id)
                 fallback_parts = []
-                if (paths["shortest_path"] or paths["less_crowded_path"]):
+                if (paths["shortest_path"] or paths["less_crowded_path"] or paths.get("extreme_path")):
                     if actual_start_id != start_id:
                         fallback_parts.append(f"출발: {stop_label(actual_start_id, stops)}")
                     if actual_end_id != end_id:
@@ -500,8 +557,13 @@ def main():
                     "end_id": actual_end_id,
                     "shortest_path": paths["shortest_path"],
                     "less_crowded_path": paths["less_crowded_path"],
+                    "extreme_path": paths.get("extreme_path"),
                     "fallback_notice": fallback_notice,
                 }
+                st.session_state["scroll_to_results_seq"] = (
+                    st.session_state.get("scroll_to_results_seq", 0) + 1
+                )
+                should_scroll_to_results = True
             except RuntimeError as error:
                 st.error(f"Pathfinder 실행 중 오류가 발생했습니다: {error}")
 
@@ -515,6 +577,9 @@ def main():
     render_crowded_stops(crowded_hour, stops)
 
     st.caption("거리는 정류장 좌표 사이의 직선거리 추정값이며, 실제 도로 거리는 다를 수 있습니다.")
+
+    if should_scroll_to_results:
+        scroll_to_results(st.session_state["scroll_to_results_seq"])
 
 
 if __name__ == "__main__":

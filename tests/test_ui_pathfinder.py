@@ -41,16 +41,22 @@ def main():
     )
     seoul_fast = seoul_res["shortest_path"]
     seoul_comfy = seoul_res["less_crowded_path"]
+    seoul_extreme = seoul_res["extreme_path"]
     assert seoul_fast is not None and len(seoul_fast) > 0
     assert seoul_comfy is not None and len(seoul_comfy) > 0
+    assert seoul_extreme is not None and len(seoul_extreme) > 0
     assert all(edge["congestion"] is not None for edge in seoul_fast)
     assert all(edge["congestion"] is not None for edge in seoul_comfy)
+    assert all(edge["congestion"] is not None for edge in seoul_extreme)
     s_fast = bus_route_logic.path_summary(seoul_fast)
     s_comfy = bus_route_logic.path_summary(seoul_comfy)
+    s_extreme = bus_route_logic.path_summary(seoul_extreme)
     assert s_fast["distance_km"] > 0.0
     assert s_fast["congestion"] is not None
+    assert s_extreme["congestion"] <= s_comfy["congestion"] + 1e-9
     print(f"[PASS] Seoul route fast: {len(seoul_fast)} edges, {s_fast['minutes']:.1f} min, {s_fast['distance_km']:.2f} km, cong={s_fast['congestion']*100:.1f}%")
     print(f"[PASS] Seoul route comfy: {len(seoul_comfy)} edges, {s_comfy['minutes']:.1f} min, {s_comfy['distance_km']:.2f} km, cong={s_comfy['congestion']*100:.1f}%")
+    print(f"[PASS] Seoul route extreme: {len(seoul_extreme)} edges, {s_extreme['minutes']:.1f} min, {s_extreme['distance_km']:.2f} km, cong={s_extreme['congestion']*100:.1f}%")
 
     # 존재하지 않는 정류장 입력 시 크래시 없이 None 반환
     missing = bus_route_logic.find_paths_with_pathfinder(

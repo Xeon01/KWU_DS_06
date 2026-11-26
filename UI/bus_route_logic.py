@@ -413,8 +413,9 @@ def find_paths_with_pathfinder(
     stops=None,
     candidate_ids=None,
     allow_nearby_fallback=True,
+    include_extreme=True,
 ):
-    """C++ Pathfinder를 호출해 최단 시간 경로(alpha=0)와 혼잡 회피 경로(alpha)를 계산한다."""
+    """C++ Pathfinder를 호출해 최단 시간 경로(alpha=0), 혼잡 회피 경로(alpha), 극단적 회피 경로를 계산한다."""
     if stops is None:
         stops = load_stops()
 
@@ -444,6 +445,8 @@ def find_paths_with_pathfinder(
             dst_arg,
             str(out_csv),
         ]
+        if include_extreme:
+            cmd.append("--extreme")
         proc = subprocess.run(
             cmd,
             capture_output=True,
@@ -458,6 +461,7 @@ def find_paths_with_pathfinder(
                 return {
                     "shortest_path": None,
                     "less_crowded_path": None,
+                    "extreme_path": None,
                     "actual_start_id": str(start_id),
                     "actual_end_id": str(end_id),
                 }
@@ -465,6 +469,7 @@ def find_paths_with_pathfinder(
 
         fast_path = []
         comfy_path = []
+        extreme_path = []
         if out_csv.exists():
             with open(out_csv, "r", encoding="utf-8-sig", newline="") as f:
                 for row in csv.DictReader(f):
@@ -484,18 +489,21 @@ def find_paths_with_pathfinder(
                         "distance_km": distance_between(stops.get(s_id), stops.get(e_id)),
                         "hour": int(row["hour"]),
                     }
-                    if row_alpha == 0.0:
+                    if row_alpha < 0.0:
+                        extreme_path.append(edge)
+                    elif row_alpha == 0.0:
                         fast_path.append(edge)
                     else:
                         comfy_path.append(edge)
 
-        chosen_path = comfy_path or fast_path
+        chosen_path = comfy_path or fast_path or extreme_path
         actual_start = chosen_path[0]["start_id"] if chosen_path else str(start_id)
         actual_end = chosen_path[-1]["end_id"] if chosen_path else str(end_id)
 
         return {
             "shortest_path": fast_path or None,
             "less_crowded_path": (comfy_path or fast_path) if alpha > 0.0 and (comfy_path or fast_path) else (comfy_path or None),
+            "extreme_path": extreme_path or None,
             "actual_start_id": actual_start,
             "actual_end_id": actual_end,
         }

@@ -321,7 +321,8 @@ TimePathResult shortestPathTimeDependent(const ds::Vector<Graph>& graphs,
                                            const UnifiedStopIndex& idx,
                                            int srcId, int dstId,
                                            int startHour, int startMinute,
-                                           double alpha) {
+                                           double alpha,
+                                           bool extremeCongestion = false) {
     TimePathResult result;
     int s = idx.denseOf(srcId);
     int t = idx.denseOf(dstId);
@@ -383,7 +384,7 @@ TimePathResult shortestPathTimeDependent(const ds::Vector<Graph>& graphs,
             const Edge& e = gCur.edge(ei);
             if (!e.hasData()) continue;  // 미운행/혼잡도 미집계 간선은 탐색하지 않음
             if (!std::isfinite(e.travelTime) || e.travelTime < 0.0) continue;
-            double stepCost = e.cost(alpha);
+            double stepCost = extremeCongestion ? e.extremeCost() : e.cost(alpha);
             if (!std::isfinite(stepCost) || stepCost < 0.0) continue;
 
             int v = idx.denseOf(e.dstId);
@@ -456,10 +457,17 @@ ds::Vector<Graph> loadAllGraphs(const std::string& folder) {
 
 // 두 정류장 기준 시간 의존 탐색 결과 출력
 void printPath(const ds::Vector<Graph>& graphs, const TimePathResult& r, const StopDirectory& dir,
-               int startHour, int startMinute, int srcId, int dstId, double alpha) {
-    std::printf("\n[%02d:%02d 출발 | %s -> %s | alpha=%.2f]\n",
-                startHour, startMinute,
-                dir.formatStop(srcId).c_str(), dir.formatStop(dstId).c_str(), alpha);
+               int startHour, int startMinute, int srcId, int dstId, double alpha,
+               bool extremeCongestion = false) {
+    if (extremeCongestion) {
+        std::printf("\n[%02d:%02d 출발 | %s -> %s | 극단적 회피(혼잡도*시간)]\n",
+                    startHour, startMinute,
+                    dir.formatStop(srcId).c_str(), dir.formatStop(dstId).c_str());
+    } else {
+        std::printf("\n[%02d:%02d 출발 | %s -> %s | alpha=%.2f]\n",
+                    startHour, startMinute,
+                    dir.formatStop(srcId).c_str(), dir.formatStop(dstId).c_str(), alpha);
+    }
 
     if (!r.found()) {
         std::cout << "  -> 두 정류장 간 이동 가능한 경로가 없습니다.\n";
@@ -530,7 +538,7 @@ void printPath(const ds::Vector<Graph>& graphs, const TimePathResult& r, const S
 // 탐색된 경로를 CSV 파일로 저장 (각 구간이 참조한 시간대 hour 기록, 신규 생성 시 UTF-8 BOM 및 헤더 기록)
 bool savePathToCsv(const std::string& csvPath, const ds::Vector<Graph>& graphs,
                    const TimePathResult& r, const StopDirectory& dir, double alpha,
-                   bool append = true) {
+                   bool append = true, bool extremeCongestion = false) {
     if (!r.found() && append) return true;
 
     std::error_code ec;
@@ -568,7 +576,8 @@ bool savePathToCsv(const std::string& csvPath, const ds::Vector<Graph>& graphs,
         if (e.load >= 0.0) f << e.load;
         f << ',';
         if (e.hasData()) f << e.congestion;
-        f << ',' << e.cost(alpha) << ',' << (isTransfer ? 1 : 0) << '\n';
+        const double stepCost = extremeCongestion ? e.extremeCost() : e.cost(alpha);
+        f << ',' << stepCost << ',' << (isTransfer ? 1 : 0) << '\n';
 
         prevRouteId = e.routeId;
     }
@@ -588,6 +597,7 @@ int main(int argc, char* argv[]) {
 
     ds::Vector<std::string> posArgs;
     bool queryMode = false;
+    bool includeExtreme = false;
     int queryHour = 0;
     int queryMinute = 0;
     std::string querySrc;
@@ -596,7 +606,9 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--query") {
+        if (arg == "--extreme") {
+            includeExtreme = true;
+        } else if (arg == "--query") {
             if (i + 4 >= argc) {
                 std::cerr << "[오류] --query 사용법: --query <시(0~23)> <분(0~59)> <시작정류장> <도착정류장> [출력CSV]\n";
                 return 1;
@@ -730,6 +742,15 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
+        if (includeExtreme) {
+            TimePathResult extremeResult =
+                shortestPathTimeDependent(graphs, stopIndex, chosenSrc, chosenDst, queryHour, queryMinute, 0.0, true);
+            printPath(graphs, extremeResult, dir, queryHour, queryMinute, chosenSrc, chosenDst, -1.0, true);
+            if (!savePathToCsv(queryOutCsv, graphs, extremeResult, dir, -1.0, true, true)) {
+                std::cerr << "[오류] 결과 CSV 저장 실패: " << queryOutCsv << '\n';
+                return 1;
+            }
+        }
         return 0;
     }
 
@@ -797,8 +818,17 @@ int main(int argc, char* argv[]) {
             savedComfy = savePathToCsv("path_results.csv", graphs, comfyResult, dir, alpha);
         }
 
+        // 3. 극단적 혼잡 회피 경로 (혼잡도 * 이동시간)
+        bool savedExtreme = true;
+        if (includeExtreme) {
+            TimePathResult extremeResult =
+                shortestPathTimeDependent(graphs, stopIndex, srcId, dstId, hour, minute, 0.0, true);
+            printPath(graphs, extremeResult, dir, hour, minute, srcId, dstId, -1.0, true);
+            savedExtreme = savePathToCsv("path_results.csv", graphs, extremeResult, dir, -1.0, true, true);
+        }
+
         if (fastResult.found()) {
-            if (savedFast && savedComfy) {
+            if (savedFast && savedComfy && savedExtreme) {
                 std::cout << "  -> 상세 경로가 'path_results.csv'에 저장되었습니다.\n";
             } else {
                 std::cerr << "  [경고] 'path_results.csv' 저장 중 오류가 발생했습니다.\n";
