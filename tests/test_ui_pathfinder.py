@@ -83,6 +83,49 @@ def main():
     assert by_name is not None and "광운" in stops[by_name["stop_id"]]["name"]
     print(f"[PASS] Name/place resolution for '광운대학교': {stops[by_name['stop_id']]['name']} ({by_name['stop_id']}, method={by_name['method']})")
 
+    # 주소/좌표 -> 가장 가까운 정류장 5개 거리순 조회 및 연결 가능 필터링 검증
+    nearest_5 = bus_route_logic.resolve_place_to_nearest_stops("37.6194, 127.0598", stops, limit=5)
+    assert len(nearest_5) == 5
+    dists = [c["distance_km"] for c in nearest_5]
+    assert dists == sorted(dists), f"Expected ascending distances, got {dists}"
+    print(f"[PASS] Top-5 nearest stops sorted by distance: {[stops[c['stop_id']]['name'] for c in nearest_5]}")
+
+    # 연결 가능 쌍 확인 및 필터링(연결 불가능한 공항버스/미운행 정류장 제외) 검증
+    mixed_origins = [
+        {"stop_id": "101000308", "distance_km": 0.05},  # 미운행 정류장
+        {"stop_id": "110000234", "distance_km": 0.15},  # 광운대학교 (연결 가능)
+        {"stop_id": "108000014", "distance_km": 0.25},  # 우이동도선사입구 (연결 가능)
+    ]
+    mixed_dests = [
+        {"stop_id": "122000606", "distance_km": 0.05},  # 공항버스 전용 강남역 (단절)
+        {"stop_id": "122000181", "distance_km": 0.20},  # 강남역12번출구 (연결 가능)
+    ]
+    filtered = bus_route_logic.filter_reachable_stop_candidates(mixed_origins, mixed_dests, hour=14, minute=41)
+    assert filtered["origin_filtered"] is True
+    assert filtered["dest_filtered"] is True
+    assert [c["stop_id"] for c in filtered["origin_options"]] == ["110000234", "108000014"]
+    assert [c["stop_id"] for c in filtered["dest_options"]] == ["122000181"]
+    assert filtered["default_origin_id"] == "110000234"
+    assert filtered["default_dest_id"] == "122000181"
+    print("[PASS] Reachable candidate filtering excludes disconnected/non-operating stops and preserves distance order")
+
+    # 후보 전체가 연결 불가능할 때는 원래 후보(거리순)를 유지하는 폴백 검증
+    unconnected_origins = [
+        {"stop_id": "101000308", "distance_km": 0.10},
+        {"stop_id": "101000311", "distance_km": 0.20},
+    ]
+    unconnected_dests = [
+        {"stop_id": "122000606", "distance_km": 0.10},
+    ]
+    fallback_filtered = bus_route_logic.filter_reachable_stop_candidates(
+        unconnected_origins, unconnected_dests, hour=14, minute=41
+    )
+    assert fallback_filtered["origin_filtered"] is False
+    assert fallback_filtered["dest_filtered"] is False
+    assert [c["stop_id"] for c in fallback_filtered["origin_options"]] == ["101000308", "101000311"]
+    assert [c["stop_id"] for c in fallback_filtered["dest_options"]] == ["122000606"]
+    print("[PASS] Unreachable candidate fallback preserves nearest stops in distance order")
+
     # 혼잡도 20% 단위 색상 매핑(파랑/초록/노랑/주황/빨강) 검증
     expected_colors = [
         (0.05, "#2563EB"),  # 0~20% 파랑

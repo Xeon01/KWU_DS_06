@@ -431,6 +431,95 @@ TimePathResult shortestPathTimeDependent(const ds::Vector<Graph>& graphs,
     return result;
 }
 
+// srcId에서 출발하여 dstIds 중 시간대 전환을 반영해 도달 가능한 도착 정류장 ID 목록을 반환한다.
+ds::Vector<int> findReachableTargetsTimeDependent(const ds::Vector<Graph>& graphs,
+                                                  const UnifiedStopIndex& idx,
+                                                  int srcId,
+                                                  const ds::Vector<int>& dstIds,
+                                                  int startHour, int startMinute) {
+    ds::Vector<int> reachedDstIds;
+    if (startHour < 0 || startHour >= 24) return reachedDstIds;
+    if (!graphs[startHour].hasNode(srcId)) return reachedDstIds;
+
+    int s = idx.denseOf(srcId);
+    if (s < 0) return reachedDstIds;
+
+    const size_t N = idx.denseToStop.size();
+    ds::Vector<char> isTarget(N, 0);
+    ds::Vector<char> targetReached(N, 0);
+    size_t uniqueTargets = 0;
+    for (int dstId : dstIds) {
+        int t = idx.denseOf(dstId);
+        if (t >= 0 && !isTarget[t]) {
+            isTarget[t] = 1;
+            ++uniqueTargets;
+        }
+    }
+    if (uniqueTargets == 0) return reachedDstIds;
+
+    const long long startSec =
+        static_cast<long long>(startHour) * 3600LL + static_cast<long long>(startMinute) * 60LL;
+    const size_t S = N * 24;
+    auto stateIdx = [](int dense, int h) -> size_t {
+        return static_cast<size_t>(dense) * 24 + static_cast<size_t>(h);
+    };
+
+    const double INF = std::numeric_limits<double>::infinity();
+    ds::Vector<double> bestElapsed(S, INF);
+    ds::PriorityQueue<TimeHeapItem, ds::Greater<TimeHeapItem>> pq;
+
+    size_t startState = stateIdx(s, startHour);
+    bestElapsed[startState] = 0.0;
+    pq.emplace(TimeHeapItem{0.0, 0.0, s, startHour});
+
+    size_t reachedCount = 0;
+    while (!pq.empty()) {
+        TimeHeapItem top = pq.top();
+        pq.pop();
+        double elapsed = top.elapsed;
+        int u = top.dense;
+        int curHour = top.hour;
+
+        size_t uh = stateIdx(u, curHour);
+        if (elapsed > bestElapsed[uh]) continue;
+
+        if (isTarget[u] && !targetReached[u]) {
+            targetReached[u] = 1;
+            ++reachedCount;
+            if (reachedCount == uniqueTargets) break;
+        }
+
+        int uInHour = idx.nodeIdxInHour[u][curHour];
+        if (uInHour < 0) continue;
+
+        const Graph& gCur = graphs[curHour];
+        for (int ei : gCur.nodeAt(uInHour).out) {
+            const Edge& e = gCur.edge(ei);
+            if (!e.hasData()) continue;
+            if (!std::isfinite(e.travelTime) || e.travelTime < 0.0) continue;
+
+            int v = idx.denseOf(e.dstId);
+            if (v < 0) continue;
+
+            double nt = elapsed + e.travelTime;
+            int nextHour = hourFromWallSec(startSec + static_cast<long long>(std::floor(nt)));
+            size_t vh = stateIdx(v, nextHour);
+            if (nt < bestElapsed[vh]) {
+                bestElapsed[vh] = nt;
+                pq.emplace(TimeHeapItem{nt, nt, v, nextHour});
+            }
+        }
+    }
+
+    for (int dstId : dstIds) {
+        int t = idx.denseOf(dstId);
+        if (t >= 0 && targetReached[t]) {
+            reachedDstIds.push_back(dstId);
+        }
+    }
+    return reachedDstIds;
+}
+
 // 00~23시 그래프 24개 로드 (graph_XX.bin 및 graphXX.bin 모두 지원)
 ds::Vector<Graph> loadAllGraphs(const std::string& folder) {
     ds::Vector<Graph> graphs(24);
@@ -597,6 +686,7 @@ int main(int argc, char* argv[]) {
 
     ds::Vector<std::string> posArgs;
     bool queryMode = false;
+    bool checkPairsMode = false;
     bool includeExtreme = false;
     int queryHour = 0;
     int queryMinute = 0;
@@ -608,9 +698,10 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg == "--extreme") {
             includeExtreme = true;
-        } else if (arg == "--query") {
+        } else if (arg == "--query" || arg == "--check-pairs") {
+            bool isCheckPairs = (arg == "--check-pairs");
             if (i + 4 >= argc) {
-                std::cerr << "[오류] --query 사용법: --query <시(0~23)> <분(0~59)> <시작정류장> <도착정류장> [출력CSV]\n";
+                std::cerr << "[오류] " << arg << " 사용법: " << arg << " <시(0~23)> <분(0~59)> <시작정류장> <도착정류장> [출력CSV]\n";
                 return 1;
             }
             if (!tryParseInt(argv[++i], queryHour) || queryHour < 0 || queryHour >= 24) {
@@ -626,7 +717,8 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) {
                 queryOutCsv = argv[++i];
             }
-            queryMode = true;
+            if (isCheckPairs) checkPairsMode = true;
+            else queryMode = true;
         } else {
             posArgs.push_back(arg);
         }
@@ -664,6 +756,55 @@ int main(int argc, char* argv[]) {
 
     UnifiedStopIndex stopIndex;
     stopIndex.build(graphs);
+
+    if (checkPairsMode) {
+        auto splitTokens = [](const std::string& raw) {
+            ds::Vector<std::string> out;
+            std::stringstream ss(raw);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                if (!item.empty()) out.push_back(item);
+            }
+            return out;
+        };
+
+        ds::Vector<std::string> srcTokens = splitTokens(querySrc);
+        ds::Vector<std::string> dstTokens = splitTokens(queryDst);
+        ds::Vector<int> srcIds;
+        ds::Vector<int> dstIds;
+        for (const std::string& tok : srcTokens) {
+            int id = dir.pickStopId(graphs, stopIndex, queryHour, tok, "시작 정류장", false);
+            if (id >= 0 && ds::find(srcIds.begin(), srcIds.end(), id) == srcIds.end()) {
+                srcIds.push_back(id);
+            }
+        }
+        for (const std::string& tok : dstTokens) {
+            int id = dir.pickStopId(graphs, stopIndex, queryHour, tok, "도착 정류장", true);
+            if (id >= 0 && ds::find(dstIds.begin(), dstIds.end(), id) == dstIds.end()) {
+                dstIds.push_back(id);
+            }
+        }
+
+        std::ofstream f(toFsPath(queryOutCsv), std::ios::binary);
+        if (!f) {
+            std::cerr << "[오류] 결과 CSV 저장 실패: " << queryOutCsv << '\n';
+            return 1;
+        }
+        f << "src_id,dst_id\n";
+        for (int sId : srcIds) {
+            ds::Vector<int> reached = findReachableTargetsTimeDependent(
+                graphs, stopIndex, sId, dstIds, queryHour, queryMinute);
+            for (int dId : reached) {
+                f << sId << ',' << dId << '\n';
+            }
+        }
+        f.flush();
+        if (!f) {
+            std::cerr << "[오류] 결과 CSV 저장 실패: " << queryOutCsv << '\n';
+            return 1;
+        }
+        return 0;
+    }
 
     if (queryMode) {
         auto splitTokens = [](const std::string& raw) {

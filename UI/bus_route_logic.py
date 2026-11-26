@@ -181,25 +181,30 @@ def geocode_place(query):
         return None
 
 
-def find_nearest_stop(latitude, longitude, stops, candidate_ids=None):
-    """주어진 위도·경도에서 가장 가까운 버스 정류장 ID와 거리(km)를 찾는다."""
+def find_nearest_stops(latitude, longitude, stops, candidate_ids=None, limit=5, preferred_id=None):
+    """주어진 위도·경도에서 가장 가까운 버스 정류장 (stop_id, 거리km) 목록을 거리순으로 반환한다."""
     target = {"latitude": latitude, "longitude": longitude}
     ids = candidate_ids if candidate_ids is not None else stops.keys()
-    best_id = None
-    best_dist = float("inf")
+    candidates = []
 
     for stop_id in ids:
         stop = stops.get(stop_id)
         if not stop:
             continue
         dist = distance_between(target, stop)
-        if dist is not None and dist < best_dist:
-            best_dist = dist
-            best_id = stop_id
+        if dist is not None:
+            candidates.append((dist, 0 if stop_id == preferred_id else 1, stop_id))
 
-    if best_id is None:
+    candidates.sort(key=lambda item: (item[0], item[1], str(item[2])))
+    return [(stop_id, dist) for dist, _, stop_id in candidates[: max(0, limit)]]
+
+
+def find_nearest_stop(latitude, longitude, stops, candidate_ids=None):
+    """주어진 위도·경도에서 가장 가까운 버스 정류장 ID와 거리(km)를 찾는다."""
+    nearest = find_nearest_stops(latitude, longitude, stops, candidate_ids, limit=1)
+    if not nearest:
         return None, None
-    return best_id, best_dist
+    return nearest[0]
 
 
 def find_stop_by_name(query, stops, candidate_ids=None):
@@ -239,64 +244,90 @@ def find_stop_by_name(query, stops, candidate_ids=None):
     return best_id
 
 
-def resolve_place_to_stop(query, stops, candidate_ids=None):
-    """출발/도착지 입력(좌표·장소명·정류장명)을 가장 가까운 버스 정류장으로 변환한다."""
+def resolve_place_to_nearest_stops(query, stops, candidate_ids=None, limit=5):
+    """출발/도착지 입력(좌표·장소명·정류장명)에서 가장 가까운 버스 정류장 후보를 거리순으로 반환한다."""
     cleaned = (query or "").strip()
-    if not cleaned:
-        return None
+    if not cleaned or limit <= 0:
+        return []
+
+    anchor_lat = None
+    anchor_lon = None
+    method = None
+    place_name = None
+    preferred_id = None
 
     coords = parse_coordinates(cleaned)
     if coords is not None:
-        lat, lon = coords
-        stop_id, dist_km = find_nearest_stop(lat, lon, stops, candidate_ids)
-        if stop_id is not None:
-            return {
-                "stop_id": stop_id,
-                "distance_km": dist_km,
-                "method": "coordinates",
-                "place_name": f"{lat:.5f}, {lon:.5f}",
-            }
+        anchor_lat, anchor_lon = coords
+        method = "coordinates"
+        place_name = f"{anchor_lat:.5f}, {anchor_lon:.5f}"
+    else:
+        # 정확한 정류장명/번호가 직접 일치하면 해당 정류장 좌표를 기준으로 주변 후보를 탐색한다.
+        q_lower = cleaned.lower()
+        ids = candidate_ids if candidate_ids is not None else stops.keys()
+        exact_id = None
+        for sid in ids:
+            stop = stops.get(sid)
+            if stop and (
+                stop["name"].lower() == q_lower
+                or (stop.get("ars_id") or "").lower() == q_lower
+                or str(sid).lower() == q_lower
+            ):
+                exact_id = sid
+                break
 
-    # 정확한 정류장명/번호가 직접 일치하면 우선 매칭하고, 그 외에는 지오코딩 → 이름 검색 순으로 탐색
-    exact_id = None
-    q_lower = cleaned.lower()
-    ids = candidate_ids if candidate_ids is not None else stops.keys()
-    for sid in ids:
-        stop = stops.get(sid)
-        if stop and (stop["name"].lower() == q_lower or (stop.get("ars_id") or "").lower() == q_lower):
-            exact_id = sid
-            break
-    if exact_id is not None:
-        return {
-            "stop_id": exact_id,
-            "distance_km": 0.0,
-            "method": "exact_stop",
-            "place_name": stops[exact_id]["name"],
+        if exact_id is not None:
+            anchor_stop = stops[exact_id]
+            anchor_lat = anchor_stop["latitude"]
+            anchor_lon = anchor_stop["longitude"]
+            method = "exact_stop"
+            place_name = anchor_stop["name"]
+            preferred_id = exact_id
+        else:
+            geo = geocode_place(cleaned)
+            if geo is not None:
+                anchor_lat = geo["latitude"]
+                anchor_lon = geo["longitude"]
+                method = "geocode"
+                place_name = geo["display_name"]
+            else:
+                fallback_id = find_stop_by_name(cleaned, stops, candidate_ids)
+                if fallback_id is not None:
+                    anchor_stop = stops[fallback_id]
+                    anchor_lat = anchor_stop["latitude"]
+                    anchor_lon = anchor_stop["longitude"]
+                    method = "name_fallback"
+                    place_name = anchor_stop["name"]
+                    preferred_id = fallback_id
+
+    if anchor_lat is None or anchor_lon is None:
+        return []
+
+    nearest = find_nearest_stops(
+        anchor_lat,
+        anchor_lon,
+        stops,
+        candidate_ids=candidate_ids,
+        limit=limit,
+        preferred_id=preferred_id,
+    )
+    return [
+        {
+            "stop_id": stop_id,
+            "distance_km": dist_km,
+            "method": method,
+            "place_name": place_name,
         }
+        for stop_id, dist_km in nearest
+    ]
 
-    geo = geocode_place(cleaned)
-    if geo is not None:
-        stop_id, dist_km = find_nearest_stop(
-            geo["latitude"], geo["longitude"], stops, candidate_ids
-        )
-        if stop_id is not None:
-            return {
-                "stop_id": stop_id,
-                "distance_km": dist_km,
-                "method": "geocode",
-                "place_name": geo["display_name"],
-            }
 
-    fallback_id = find_stop_by_name(cleaned, stops, candidate_ids)
-    if fallback_id is not None:
-        return {
-            "stop_id": fallback_id,
-            "distance_km": None,
-            "method": "name_fallback",
-            "place_name": stops[fallback_id]["name"],
-        }
-
-    return None
+def resolve_place_to_stop(query, stops, candidate_ids=None):
+    """출발/도착지 입력(좌표·장소명·정류장명)을 가장 가까운 버스 정류장으로 변환한다."""
+    matches = resolve_place_to_nearest_stops(
+        query, stops, candidate_ids=candidate_ids, limit=1
+    )
+    return matches[0] if matches else None
 
 
 @lru_cache(maxsize=2)
@@ -512,6 +543,118 @@ def find_paths_with_pathfinder(
             out_csv.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def check_reachable_pairs(src_ids, dst_ids, hour, minute=0, allow_same_stop=False):
+    """C++ Pathfinder를 호출해 출발 후보와 도착 후보 쌍 중 실제 경로 탐색이 가능한 쌍 집합을 반환한다."""
+    src_list = [str(s) for s in src_ids if s]
+    dst_list = [str(d) for d in dst_ids if d]
+    if not src_list or not dst_list:
+        return set()
+
+    binary = ensure_pathfinder_binary()
+    with tempfile.NamedTemporaryFile(
+        prefix="pathfinder_pairs_", suffix=".csv", delete=False
+    ) as tmp:
+        out_csv = Path(tmp.name)
+
+    try:
+        cmd = [
+            str(binary),
+            str(GRAPH_DIR),
+            "0.0",
+            "nonexistent_stops.csv",
+            "--check-pairs",
+            str(int(hour)),
+            str(int(minute)),
+            ",".join(src_list),
+            ",".join(dst_list),
+            str(out_csv),
+        ]
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if proc.returncode != 0:
+            err_text = (proc.stderr or proc.stdout).strip()
+            raise RuntimeError(f"Pathfinder 연결성 확인 실패 (code={proc.returncode}): {err_text}")
+
+        reachable = set()
+        if out_csv.exists():
+            with open(out_csv, "r", encoding="utf-8-sig", newline="") as f:
+                for row in csv.DictReader(f):
+                    s_id = str(row.get("src_id", "")).strip()
+                    d_id = str(row.get("dst_id", "")).strip()
+                    if not s_id or not d_id:
+                        continue
+                    if not allow_same_stop and s_id == d_id:
+                        continue
+                    reachable.add((s_id, d_id))
+        return reachable
+    finally:
+        try:
+            out_csv.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def filter_reachable_stop_candidates(origin_candidates, dest_candidates, hour, minute=0):
+    """가까운 출발/도착 후보 정류장 중 실제 경로 연결이 가능한 정류장만 거리순으로 남긴다.
+
+    한쪽이라도 연결 가능한 정류장이 하나도 없으면 해당 쪽은 원래 후보(가까운 순)를 그대로 유지한다.
+    """
+    origin_ids = [c["stop_id"] for c in origin_candidates]
+    dest_ids = [c["stop_id"] for c in dest_candidates]
+    reachable_pairs = check_reachable_pairs(
+        origin_ids, dest_ids, hour=hour, minute=minute, allow_same_stop=False
+    )
+
+    reachable_origins = {s for s, _ in reachable_pairs}
+    reachable_dests = {d for _, d in reachable_pairs}
+
+    filtered_origins = [c for c in origin_candidates if c["stop_id"] in reachable_origins]
+    filtered_dests = [c for c in dest_candidates if c["stop_id"] in reachable_dests]
+
+    origin_filtered = bool(filtered_origins)
+    dest_filtered = bool(filtered_dests)
+    origin_options = filtered_origins if origin_filtered else list(origin_candidates)
+    dest_options = filtered_dests if dest_filtered else list(dest_candidates)
+
+    best_origin_id = origin_options[0]["stop_id"] if origin_options else None
+    best_dest_id = dest_options[0]["stop_id"] if dest_options else None
+
+    if reachable_pairs:
+        origin_meta = {
+            c["stop_id"]: (idx, c["distance_km"] if c.get("distance_km") is not None else float("inf"))
+            for idx, c in enumerate(origin_candidates)
+        }
+        dest_meta = {
+            c["stop_id"]: (idx, c["distance_km"] if c.get("distance_km") is not None else float("inf"))
+            for idx, c in enumerate(dest_candidates)
+        }
+        best_pair = min(
+            reachable_pairs,
+            key=lambda pair: (
+                origin_meta[pair[0]][1] + dest_meta[pair[1]][1],
+                origin_meta[pair[0]][0] + dest_meta[pair[1]][0],
+                origin_meta[pair[0]][0],
+                dest_meta[pair[1]][0],
+            ),
+        )
+        best_origin_id, best_dest_id = best_pair
+
+    return {
+        "origin_options": origin_options,
+        "origin_filtered": origin_filtered,
+        "dest_options": dest_options,
+        "dest_filtered": dest_filtered,
+        "default_origin_id": best_origin_id,
+        "default_dest_id": best_dest_id,
+        "reachable_pairs": reachable_pairs,
+    }
 
 
 def find_path(graph, start_id, end_id, avoid_congestion=False, hour=0, minute=0):

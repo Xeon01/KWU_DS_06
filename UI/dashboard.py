@@ -11,17 +11,37 @@ from bus_route_logic import (
     build_graph,
     congestion_color_info,
     crowded_stops,
+    filter_reachable_stop_candidates,
     find_paths_with_pathfinder,
     group_legs_with_styles,
     load_data,
     path_summary,
-    resolve_place_to_stop,
+    resolve_place_to_nearest_stops,
 )
 
 def stop_label(stop_id, stops):
     stop = stops[stop_id]
     number = stop["ars_id"] or stop_id
     return f"{stop['name']} · {number}"
+
+
+def format_distance_text(distance_km):
+    if distance_km is None:
+        return ""
+    meters = round(distance_km * 1000)
+    if meters < 1000:
+        return f"{meters}m"
+    return f"{distance_km:.2f}km"
+
+
+def stop_option_label(stop_id, stops, distance_map=None):
+    base = stop_label(stop_id, stops)
+    if distance_map and stop_id in distance_map:
+        dist_text = format_distance_text(distance_map[stop_id])
+        if dist_text:
+            label_dist = "0m" if dist_text == "0m" else f"약 {dist_text}"
+            return f"{base} ({label_dist})"
+    return base
 
 def route_stop_rows(path, stops):
     stop_ids = [path[0]["start_id"]] + [edge["end_id"] for edge in path]
@@ -412,10 +432,31 @@ def main():
         return
 
     init_time = st.session_state.setdefault("init_departure_time", datetime.now())
+    st.session_state.setdefault("departure_hour", init_time.hour)
+    st.session_state.setdefault("departure_minute", init_time.minute)
 
     with st.container(border=True):
         st.subheader("여정 입력", anchor=False)
-        st.caption("출발/도착지(장소명·주소 또는 위도,경도)로 가까운 정류장을 자동 입력하거나, 아래에서 정류장을 직접 선택하세요.")
+        st.caption(
+            "출발 시각과 장소명·주소(또는 위도,경도)를 입력하면 가장 가까운 정류장 5곳 중 "
+            "연결 가능한 정류장만 거리순 드롭다운으로 제공합니다."
+        )
+
+        time_col, minute_col, _spacer_col = st.columns([1, 1, 4], gap="medium")
+        with time_col:
+            hour = st.selectbox(
+                "출발 시",
+                range(24),
+                key="departure_hour",
+                format_func=lambda value: f"{value:02d}시",
+            )
+        with minute_col:
+            minute = st.selectbox(
+                "출발 분",
+                range(60),
+                key="departure_minute",
+                format_func=lambda value: f"{value:02d}분",
+            )
 
         with st.form("place_lookup"):
             place_origin_col, place_dest_col = st.columns(2, gap="medium")
@@ -430,58 +471,198 @@ def main():
                     placeholder="예: 서울역 또는 37.5547, 126.9707",
                 )
             lookup_clicked = st.form_submit_button(
-                "가장 가까운 정류장 찾아서 입력",
+                "가까운 정류장 찾기",
                 use_container_width=True,
             )
 
         if lookup_clicked:
-            messages = []
-            errors = []
-            if origin_place.strip():
-                resolved = resolve_place_to_stop(origin_place, stops, station_ids)
-                if resolved:
-                    sid = resolved["stop_id"]
-                    st.session_state["origin_stop"] = sid
-                    dist_txt = (
-                        f" (약 {resolved['distance_km'] * 1000:.0f}m)"
-                        if resolved["distance_km"] is not None
-                        else " (정류장명 매칭)"
-                    )
-                    messages.append(f"출발 정류장 → {stop_label(sid, stops)}{dist_txt}")
-                else:
-                    errors.append(f"출발지 '{origin_place}'에 가까운 정류장을 찾지 못했습니다.")
+            notices = []
+            origin_query = origin_place.strip()
+            dest_query = dest_place.strip()
 
-            if dest_place.strip():
-                resolved = resolve_place_to_stop(dest_place, stops, station_ids)
-                if resolved:
-                    eid = resolved["stop_id"]
-                    st.session_state["destination_stop"] = eid
-                    dist_txt = (
-                        f" (약 {resolved['distance_km'] * 1000:.0f}m)"
-                        if resolved["distance_km"] is not None
-                        else " (정류장명 매칭)"
-                    )
-                    messages.append(f"도착 정류장 → {stop_label(eid, stops)}{dist_txt}")
-                else:
-                    errors.append(f"도착지 '{dest_place}'에 가까운 정류장을 찾지 못했습니다.")
+            if not origin_query and not dest_query:
+                notices.append(("warning", "출발지 또는 도착지를 입력하세요."))
+            else:
+                origin_raw = st.session_state.get("origin_raw_candidates")
+                dest_raw = st.session_state.get("dest_raw_candidates")
 
-            if not origin_place.strip() and not dest_place.strip():
-                st.warning("출발지 또는 도착지를 입력하세요.")
-            for msg in messages:
-                st.success(msg)
-            for err in errors:
-                st.warning(err)
+                if origin_query:
+                    origin_raw = resolve_place_to_nearest_stops(
+                        origin_query, stops, station_ids, limit=5
+                    )
+                    if origin_raw:
+                        st.session_state["origin_raw_candidates"] = origin_raw
+                    else:
+                        st.session_state.pop("origin_raw_candidates", None)
+                        st.session_state.pop("origin_dropdown_candidates", None)
+                        notices.append(
+                            ("warning", f"출발지 '{origin_query}'에 가까운 정류장을 찾지 못했습니다.")
+                        )
+                        origin_raw = None
+
+                if dest_query:
+                    dest_raw = resolve_place_to_nearest_stops(
+                        dest_query, stops, station_ids, limit=5
+                    )
+                    if dest_raw:
+                        st.session_state["dest_raw_candidates"] = dest_raw
+                    else:
+                        st.session_state.pop("dest_raw_candidates", None)
+                        st.session_state.pop("dest_dropdown_candidates", None)
+                        notices.append(
+                            ("warning", f"도착지 '{dest_query}'에 가까운 정류장을 찾지 못했습니다.")
+                        )
+                        dest_raw = None
+
+                try:
+                    if origin_raw and dest_raw:
+                        filtered = filter_reachable_stop_candidates(
+                            origin_raw, dest_raw, hour=hour, minute=minute
+                        )
+                        st.session_state["origin_dropdown_candidates"] = filtered["origin_options"]
+                        st.session_state["dest_dropdown_candidates"] = filtered["dest_options"]
+                        st.session_state["origin_stop"] = filtered["default_origin_id"]
+                        st.session_state["destination_stop"] = filtered["default_dest_id"]
+
+                        if filtered["origin_filtered"]:
+                            notices.append((
+                                "success",
+                                f"출발지: 가까운 정류장 {len(origin_raw)}곳 중 연결 가능한 "
+                                f"{len(filtered['origin_options'])}곳을 거리순으로 표시합니다.",
+                            ))
+                        else:
+                            notices.append((
+                                "warning",
+                                f"출발지 주변 정류장 {len(origin_raw)}곳에서 도착지 후보까지 "
+                                f"연결되는 경로를 찾지 못해 가까운 {len(origin_raw)}곳을 모두 거리순으로 표시합니다.",
+                            ))
+
+                        if filtered["dest_filtered"]:
+                            notices.append((
+                                "success",
+                                f"도착지: 가까운 정류장 {len(dest_raw)}곳 중 연결 가능한 "
+                                f"{len(filtered['dest_options'])}곳을 거리순으로 표시합니다.",
+                            ))
+                        else:
+                            notices.append((
+                                "warning",
+                                f"도착지 주변 정류장 {len(dest_raw)}곳으로 연결되는 경로를 찾지 못해 "
+                                f"가까운 {len(dest_raw)}곳을 모두 거리순으로 표시합니다.",
+                            ))
+                    elif origin_raw:
+                        existing_dest = st.session_state.get("destination_stop")
+                        if existing_dest:
+                            filtered = filter_reachable_stop_candidates(
+                                origin_raw,
+                                [{"stop_id": existing_dest, "distance_km": 0.0}],
+                                hour=hour,
+                                minute=minute,
+                            )
+                            st.session_state["origin_dropdown_candidates"] = filtered["origin_options"]
+                            st.session_state["origin_stop"] = filtered["default_origin_id"]
+                            if filtered["origin_filtered"]:
+                                notices.append((
+                                    "success",
+                                    f"출발지: 가까운 정류장 {len(origin_raw)}곳 중 선택한 도착지까지 "
+                                    f"연결 가능한 {len(filtered['origin_options'])}곳을 거리순으로 표시합니다.",
+                                ))
+                            else:
+                                notices.append((
+                                    "warning",
+                                    f"출발지 주변 정류장 {len(origin_raw)}곳에서 선택한 도착지까지 "
+                                    f"연결되는 경로를 찾지 못해 가까운 {len(origin_raw)}곳을 모두 거리순으로 표시합니다.",
+                                ))
+                        else:
+                            st.session_state["origin_dropdown_candidates"] = origin_raw
+                            st.session_state["origin_stop"] = origin_raw[0]["stop_id"]
+                            notices.append((
+                                "info",
+                                f"출발지 주변 가까운 정류장 {len(origin_raw)}곳을 거리순으로 표시했습니다. "
+                                "도착지도 검색하면 연결 가능한 정류장만 필터링됩니다.",
+                            ))
+                    elif dest_raw:
+                        existing_origin = st.session_state.get("origin_stop")
+                        if existing_origin:
+                            filtered = filter_reachable_stop_candidates(
+                                [{"stop_id": existing_origin, "distance_km": 0.0}],
+                                dest_raw,
+                                hour=hour,
+                                minute=minute,
+                            )
+                            st.session_state["dest_dropdown_candidates"] = filtered["dest_options"]
+                            st.session_state["destination_stop"] = filtered["default_dest_id"]
+                            if filtered["dest_filtered"]:
+                                notices.append((
+                                    "success",
+                                    f"도착지: 가까운 정류장 {len(dest_raw)}곳 중 선택한 출발지에서 "
+                                    f"연결 가능한 {len(filtered['dest_options'])}곳을 거리순으로 표시합니다.",
+                                ))
+                            else:
+                                notices.append((
+                                    "warning",
+                                    f"도착지 주변 정류장 {len(dest_raw)}곳으로 연결되는 경로를 찾지 못해 "
+                                    f"가까운 {len(dest_raw)}곳을 모두 거리순으로 표시합니다.",
+                                ))
+                        else:
+                            st.session_state["dest_dropdown_candidates"] = dest_raw
+                            st.session_state["destination_stop"] = dest_raw[0]["stop_id"]
+                            notices.append((
+                                "info",
+                                f"도착지 주변 가까운 정류장 {len(dest_raw)}곳을 거리순으로 표시했습니다. "
+                                "출발지도 검색하면 연결 가능한 정류장만 필터링됩니다.",
+                            ))
+                except RuntimeError as error:
+                    notices.append(("error", f"정류장 연결성 검사 중 오류가 발생했습니다: {error}"))
+
+            st.session_state["lookup_notices"] = notices
+
+        for level, msg in st.session_state.get("lookup_notices", []):
+            getattr(st, level)(msg)
+
+        origin_cands = st.session_state.get("origin_dropdown_candidates")
+        dest_cands = st.session_state.get("dest_dropdown_candidates")
+        if origin_cands or dest_cands:
+            if st.button("전체 정류장 선택으로 복원"):
+                for key in (
+                    "origin_raw_candidates",
+                    "dest_raw_candidates",
+                    "origin_dropdown_candidates",
+                    "dest_dropdown_candidates",
+                    "lookup_notices",
+                ):
+                    st.session_state.pop(key, None)
+                st.session_state["origin_stop"] = None
+                st.session_state["destination_stop"] = None
+                st.rerun()
+
+        if origin_cands:
+            origin_option_ids = [c["stop_id"] for c in origin_cands]
+            origin_dist_map = {c["stop_id"]: c.get("distance_km") for c in origin_cands}
+            if st.session_state.get("origin_stop") not in origin_option_ids:
+                st.session_state["origin_stop"] = origin_option_ids[0]
+        else:
+            origin_option_ids = station_ids
+            origin_dist_map = None
+
+        if dest_cands:
+            dest_option_ids = [c["stop_id"] for c in dest_cands]
+            dest_dist_map = {c["stop_id"]: c.get("distance_km") for c in dest_cands}
+            if st.session_state.get("destination_stop") not in dest_option_ids:
+                st.session_state["destination_stop"] = dest_option_ids[0]
+        else:
+            dest_option_ids = station_ids
+            dest_dist_map = None
 
         with st.form("route_search"):
-            origin_col, destination_col, time_col, minute_col = st.columns([2, 2, 1, 1], gap="medium")
+            origin_col, destination_col = st.columns(2, gap="medium")
             with origin_col:
                 st.markdown("**출발 정류장** · 타는 곳")
                 start_id = st.selectbox(
                     "출발 정류장",
-                    station_ids,
+                    origin_option_ids,
                     index=None,
                     placeholder="출발 정류장 검색",
-                    format_func=lambda stop_id: stop_label(stop_id, stops),
+                    format_func=lambda stop_id: stop_option_label(stop_id, stops, origin_dist_map),
                     label_visibility="collapsed",
                     key="origin_stop",
                 )
@@ -489,26 +670,12 @@ def main():
                 st.markdown("**도착 정류장** · 내리는 곳")
                 end_id = st.selectbox(
                     "도착 정류장",
-                    station_ids,
+                    dest_option_ids,
                     index=None,
                     placeholder="도착 정류장 검색",
-                    format_func=lambda stop_label_id: stop_label(stop_label_id, stops),
+                    format_func=lambda stop_label_id: stop_option_label(stop_label_id, stops, dest_dist_map),
                     label_visibility="collapsed",
                     key="destination_stop",
-                )
-            with time_col:
-                hour = st.selectbox(
-                    "출발 시",
-                    range(24),
-                    index=init_time.hour,
-                    format_func=lambda value: f"{value:02d}시",
-                )
-            with minute_col:
-                minute = st.selectbox(
-                    "출발 분",
-                    range(60),
-                    index=init_time.minute,
-                    format_func=lambda value: f"{value:02d}분",
                 )
             search_clicked = st.form_submit_button(
                 "경로 검색",
